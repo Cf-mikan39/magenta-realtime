@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MRT2 Linux Real-time</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <div>
+          <p class="eyebrow">MAGENTA REALTIME 2 · JAX/CUDA</p>
+          <h1>Linux real-time stream</h1>
+        </div>
+        <div id="connection-pill" class="pill idle">停止中</div>
+      </header>
+
+      <section class="panel control-panel">
+        <label for="prompt">Prompt</label>
+        <div class="prompt-row">
+          <input
+            id="prompt"
+            type="text"
+            value="disco funk"
+            maxlength="500"
+            autocomplete="off"
+          />
+          <button id="apply" class="secondary" disabled>プロンプトを適用</button>
+        </div>
+        <p class="hint">
+          再生中に変更してもストリーミング状態はリセットされません。
+        </p>
+        <div class="transport">
+          <button id="start" class="primary">再生開始</button>
+          <button id="stop" class="secondary" disabled>停止</button>
+        </div>
+      </section>
+
+      <section class="metric-grid" aria-label="stream metrics">
+        <article class="metric">
+          <span>生成時間</span>
+          <strong id="generation-ms">—</strong>
+          <small>直近フレーム</small>
+        </article>
+        <article class="metric">
+          <span>Server buffer</span>
+          <strong id="server-buffer">—</strong>
+          <small>JAX → WebSocket</small>
+        </article>
+        <article class="metric">
+          <span>Browser buffer</span>
+          <strong id="browser-buffer">—</strong>
+          <small>AudioWorklet queue</small>
+        </article>
+        <article class="metric">
+          <span>Underruns</span>
+          <strong id="underruns">0 / 0</strong>
+          <small>server / browser</small>
+        </article>
+      </section>
+
+      <section class="panel status-panel">
+        <div class="status-heading">
+          <h2>Status</h2>
+          <span id="audio-format">48 kHz · stereo · f32</span>
+        </div>
+        <p id="status" role="status">再生開始を押してください。</p>
+        <dl>
+          <div><dt>Model</dt><dd id="model">—</dd></div>
+          <div><dt>Prompt revision</dt><dd id="revision">—</dd></div>
+          <div><dt>Deadline misses</dt><dd id="deadline-misses">—</dd></div>
+        </dl>
+      </section>
+    </main>
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>
