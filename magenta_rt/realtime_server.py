@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import logging
+import math
 import threading
 import time
 from typing import Any
@@ -35,6 +36,7 @@ FRAME_RATE = 25
 FRAME_SAMPLES = SAMPLE_RATE // FRAME_RATE
 FRAME_DURATION_SECONDS = 1.0 / FRAME_RATE
 FRAME_DURATION_MS = 1000.0 * FRAME_DURATION_SECONDS
+MAX_PROMPTS = 6
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,82 @@ class PromptConditioning:
 
 
 @dataclass(frozen=True)
+class PromptDefinition:
+  """A client-visible prompt slot before its text is embedded."""
+
+  prompt_id: int
+  text: str
+  weight: float
+
+
+class PromptMixer:
+  """Cache prompt embeddings and atomically publish their weighted blend."""
+
+  def __init__(self, definitions, embeddings):
+    definitions = tuple(definitions)
+    embeddings = tuple(_validate_embeddings(definitions, embeddings))
+    style = blend_style_embeddings(
+        embeddings, [definition.weight for definition in definitions]
+    )
+    self._definitions = definitions
+    self._embeddings = embeddings
+    self._snapshot = PromptSnapshot(
+        text=_describe_mix(definitions),
+        style=style,
+        revision=0,
+    )
+    self._lock = threading.Lock()
+
+  def get(self) -> PromptSnapshot:
+    with self._lock:
+      return self._snapshot
+
+  def definitions(self) -> tuple[PromptDefinition, ...]:
+    with self._lock:
+      return self._definitions
+
+  def configure(self, definitions, embeddings) -> PromptSnapshot:
+    """Atomically replace prompt slots after their embeddings are ready."""
+    definitions = tuple(definitions)
+    embeddings = tuple(_validate_embeddings(definitions, embeddings))
+    style = blend_style_embeddings(
+        embeddings, [definition.weight for definition in definitions]
+    )
+    with self._lock:
+      self._definitions = definitions
+      self._embeddings = embeddings
+      self._snapshot = PromptSnapshot(
+          text=_describe_mix(definitions),
+          style=style,
+          revision=self._snapshot.revision + 1,
+      )
+      return self._snapshot
+
+  def update_weights(self, values: object) -> PromptSnapshot:
+    """Apply raw 0–1 weights without re-running the text encoder."""
+    with self._lock:
+      weights_by_id = validate_weight_update(values, self._definitions)
+      definitions = tuple(
+          PromptDefinition(
+              prompt_id=definition.prompt_id,
+              text=definition.text,
+              weight=weights_by_id[definition.prompt_id],
+          )
+          for definition in self._definitions
+      )
+      style = blend_style_embeddings(
+          self._embeddings,
+          [definition.weight for definition in definitions],
+      )
+      self._definitions = definitions
+      self._snapshot = PromptSnapshot(
+          text=_describe_mix(definitions),
+          style=style,
+          revision=self._snapshot.revision + 1,
+      )
+      return self._snapshot
+
+@dataclass(frozen=True)
 class ProducerStats:
   """A consistent snapshot of inference-thread timing counters."""
 
@@ -88,7 +166,7 @@ class JaxRealtimeProducer(threading.Thread):
       self,
       *,
       mrt,
-      prompt: PromptConditioning,
+      prompt: PromptConditioning | PromptMixer,
       ring_buffer: StereoRingBuffer,
       logger: logging.Logger | None = None,
   ):
@@ -174,6 +252,134 @@ def validate_prompt(value: object, *, max_length: int = 500) -> str:
   if len(prompt) > max_length:
     raise ValueError(f"prompt must be at most {max_length} characters")
   return prompt
+
+
+def validate_prompt_definitions(value: object) -> tuple[PromptDefinition, ...]:
+  """Validate one to six prompt slots from a WebSocket message."""
+  if not isinstance(value, list):
+    raise ValueError("prompts must be an array")
+  if not 1 <= len(value) <= MAX_PROMPTS:
+    raise ValueError(f"prompts must contain between 1 and {MAX_PROMPTS} items")
+
+  definitions = []
+  seen_ids = set()
+  for index, item in enumerate(value):
+    if not isinstance(item, dict):
+      raise ValueError(f"prompts[{index}] must be an object")
+    prompt_id = item.get("id")
+    if isinstance(prompt_id, bool) or not isinstance(prompt_id, int):
+      raise ValueError(f"prompts[{index}].id must be an integer")
+    if prompt_id < 0:
+      raise ValueError(f"prompts[{index}].id must be non-negative")
+    if prompt_id in seen_ids:
+      raise ValueError(f"duplicate prompt id: {prompt_id}")
+    seen_ids.add(prompt_id)
+
+    text = validate_prompt(item.get("text"))
+    weight = _validate_weight(item.get("weight"), f"prompts[{index}].weight")
+    definitions.append(PromptDefinition(prompt_id, text, weight))
+
+  if sum(definition.weight for definition in definitions) <= 0:
+    raise ValueError("at least one prompt weight must be greater than zero")
+  return tuple(definitions)
+
+
+def validate_weight_update(
+    value: object, definitions
+) -> dict[int, float]:
+  """Validate a complete weight update for the active prompt IDs."""
+  if not isinstance(value, list):
+    raise ValueError("weights must be an array")
+  expected_ids = {definition.prompt_id for definition in definitions}
+  weights = {}
+  for index, item in enumerate(value):
+    if not isinstance(item, dict):
+      raise ValueError(f"weights[{index}] must be an object")
+    prompt_id = item.get("id")
+    if isinstance(prompt_id, bool) or not isinstance(prompt_id, int):
+      raise ValueError(f"weights[{index}].id must be an integer")
+    if prompt_id in weights:
+      raise ValueError(f"duplicate weight id: {prompt_id}")
+    weights[prompt_id] = _validate_weight(
+        item.get("weight"), f"weights[{index}].weight"
+    )
+  if set(weights) != expected_ids:
+    raise ValueError("weight update IDs must match the active prompt IDs")
+  if sum(weights.values()) <= 0:
+    raise ValueError("at least one prompt weight must be greater than zero")
+  return weights
+
+
+def normalize_prompt_weights(values) -> np.ndarray:
+  """Normalize non-negative prompt weights to sum to one."""
+  weights = np.asarray(values, dtype=np.float32)
+  if weights.ndim != 1 or weights.size == 0:
+    raise ValueError("weights must be a non-empty one-dimensional array")
+  if not np.all(np.isfinite(weights)) or np.any(weights < 0):
+    raise ValueError("weights must be finite and non-negative")
+  total = float(np.sum(weights))
+  if total <= 0:
+    raise ValueError("at least one prompt weight must be greater than zero")
+  return weights / total
+
+
+def blend_style_embeddings(embeddings, weights) -> np.ndarray:
+  """Blend MusicCoCa embeddings before MRT2 performs RVQ quantization."""
+  embedding_array = np.stack(
+      [np.asarray(embedding, dtype=np.float32) for embedding in embeddings]
+  )
+  normalized = normalize_prompt_weights(weights)
+  if embedding_array.ndim != 2:
+    raise ValueError("each style embedding must be one-dimensional")
+  if embedding_array.shape[0] != normalized.size:
+    raise ValueError("embedding and weight counts must match")
+  return np.sum(embedding_array * normalized[:, np.newaxis], axis=0)
+
+
+def prompt_definitions_to_json(definitions) -> list[dict]:
+  """Return normalized client metadata for a prompt bank."""
+  normalized = normalize_prompt_weights(
+      [definition.weight for definition in definitions]
+  )
+  return [
+      {
+          "id": definition.prompt_id,
+          "text": definition.text,
+          "weight": definition.weight,
+          "normalized_weight": float(normalized[index]),
+      }
+      for index, definition in enumerate(definitions)
+  ]
+
+
+def _validate_weight(value: object, name: str) -> float:
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    raise ValueError(f"{name} must be a number")
+  weight = float(value)
+  if not math.isfinite(weight) or not 0.0 <= weight <= 1.0:
+    raise ValueError(f"{name} must be within [0, 1]")
+  return weight
+
+
+def _validate_embeddings(definitions, embeddings) -> list[np.ndarray]:
+  if len(definitions) != len(embeddings):
+    raise ValueError("prompt and embedding counts must match")
+  arrays = [np.asarray(embedding, dtype=np.float32) for embedding in embeddings]
+  if not arrays or any(array.ndim != 1 for array in arrays):
+    raise ValueError("each style embedding must be one-dimensional")
+  if len({array.shape for array in arrays}) != 1:
+    raise ValueError("all style embeddings must have the same shape")
+  return arrays
+
+
+def _describe_mix(definitions) -> str:
+  normalized = normalize_prompt_weights(
+      [definition.weight for definition in definitions]
+  )
+  return ", ".join(
+      f"{definition.text}:{normalized[index]:.3f}"
+      for index, definition in enumerate(definitions)
+  )
 
 
 def validate_audio_frame(waveform) -> np.ndarray:

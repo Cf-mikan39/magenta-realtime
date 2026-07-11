@@ -20,11 +20,16 @@ import unittest
 import numpy as np
 
 from magenta_rt.realtime import StereoRingBuffer
+from magenta_rt.realtime_server import blend_style_embeddings
 from magenta_rt.realtime_server import encode_pcm_f32le
 from magenta_rt.realtime_server import FRAME_SAMPLES
 from magenta_rt.realtime_server import JaxRealtimeProducer
 from magenta_rt.realtime_server import PromptConditioning
+from magenta_rt.realtime_server import PromptDefinition
+from magenta_rt.realtime_server import PromptMixer
 from magenta_rt.realtime_server import SAMPLE_RATE
+from magenta_rt.realtime_server import normalize_prompt_weights
+from magenta_rt.realtime_server import validate_prompt_definitions
 from magenta_rt.realtime_server import validate_prompt
 
 
@@ -64,6 +69,70 @@ class PromptConditioningTest(unittest.TestCase):
       validate_prompt("  ")
     with self.assertRaises(ValueError):
       validate_prompt(123)
+
+
+class PromptMixerTest(unittest.TestCase):
+
+  def test_normalizes_and_blends_embeddings(self):
+    normalized = normalize_prompt_weights([1.0, 3.0])
+    np.testing.assert_allclose(normalized, [0.25, 0.75])
+    blended = blend_style_embeddings(
+        [
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([0.0, 1.0], dtype=np.float32),
+        ],
+        [1.0, 3.0],
+    )
+    np.testing.assert_allclose(blended, [0.25, 0.75])
+
+  def test_validates_prompt_bank(self):
+    definitions = validate_prompt_definitions(
+        [
+            {"id": 10, "text": "disco", "weight": 1.0},
+            {"id": 20, "text": "ambient", "weight": 0.5},
+        ]
+    )
+    self.assertEqual(
+        [definition.prompt_id for definition in definitions], [10, 20]
+    )
+    with self.assertRaises(ValueError):
+      validate_prompt_definitions(
+          [
+              {"id": 1, "text": "one", "weight": 0.0},
+              {"id": 1, "text": "two", "weight": 0.0},
+          ]
+      )
+
+  def test_weight_updates_do_not_replace_cached_embeddings(self):
+    definitions = (
+        PromptDefinition(0, "left", 1.0),
+        PromptDefinition(1, "right", 0.0),
+    )
+    mixer = PromptMixer(
+        definitions,
+        [
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([0.0, 1.0], dtype=np.float32),
+        ],
+    )
+    updated = mixer.update_weights(
+        [{"id": 0, "weight": 0.25}, {"id": 1, "weight": 0.75}]
+    )
+    self.assertEqual(updated.revision, 1)
+    np.testing.assert_allclose(updated.style, [0.25, 0.75])
+
+  def test_configure_replaces_bank_atomically(self):
+    mixer = PromptMixer(
+        (PromptDefinition(0, "old", 1.0),),
+        [np.array([1.0, 0.0], dtype=np.float32)],
+    )
+    updated = mixer.configure(
+        (PromptDefinition(2, "new", 1.0),),
+        [np.array([0.0, 1.0], dtype=np.float32)],
+    )
+    self.assertEqual(updated.revision, 1)
+    self.assertEqual(mixer.definitions()[0].text, "new")
+    np.testing.assert_array_equal(updated.style, [0.0, 1.0])
 
 
 class PcmEncodingTest(unittest.TestCase):

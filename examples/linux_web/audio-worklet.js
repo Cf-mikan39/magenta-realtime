@@ -5,6 +5,7 @@ class Mrt2PcmPlayer extends AudioWorkletProcessor {
     const config = options.processorOptions ?? {};
     this.frameSamples = config.frameSamples ?? 1_920;
     this.targetFrames = config.targetFrames ?? 3;
+    this.maxTargetFrames = config.maxTargetFrames ?? 6;
     this.targetSamples = this.frameSamples * this.targetFrames;
     this.chunks = [];
     this.chunkOffset = 0;
@@ -22,6 +23,7 @@ class Mrt2PcmPlayer extends AudioWorkletProcessor {
       } else if (data.type === 'configure') {
         this.frameSamples = data.frameSamples;
         this.targetFrames = data.targetFrames;
+        this.maxTargetFrames = data.maxTargetFrames ?? this.maxTargetFrames;
         this.targetSamples = this.frameSamples * this.targetFrames;
       } else if (data.type === 'reset') {
         this.reset();
@@ -73,6 +75,11 @@ class Mrt2PcmPlayer extends AudioWorkletProcessor {
       if (copied < left.length) {
         this.underruns += 1;
         this.playing = false;
+        this.targetFrames = Math.min(
+          this.maxTargetFrames,
+          this.targetFrames + 1,
+        );
+        this.targetSamples = this.frameSamples * this.targetFrames;
       }
     }
 
@@ -83,6 +90,7 @@ class Mrt2PcmPlayer extends AudioWorkletProcessor {
         playing: this.playing,
         bufferMs: (1_000 * this.queuedSamples) / sampleRate,
         underruns: this.underruns,
+        targetFrames: this.targetFrames,
       });
     }
     return true;

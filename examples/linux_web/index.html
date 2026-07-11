@@ -4,7 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MRT2 Linux Real-time</title>
-    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/static/style.css?v=2" />
   </head>
   <body>
     <main class="shell">
@@ -17,20 +18,45 @@
       </header>
 
       <section class="panel control-panel">
-        <label for="prompt">Prompt</label>
-        <div class="prompt-row">
-          <input
-            id="prompt"
-            type="text"
-            value="disco funk"
-            maxlength="500"
-            autocomplete="off"
-          />
-          <button id="apply" class="secondary" disabled>プロンプトを適用</button>
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">PROMPT MIXER</p>
+            <h2>最大6個のスタイルをブレンド</h2>
+          </div>
+          <div class="mode-switch" aria-label="prompt control mode">
+            <button id="list-mode" class="mode active">Sliders</button>
+            <button id="surface-mode" class="mode">2D Surface</button>
+          </div>
         </div>
-        <p class="hint">
-          再生中に変更してもストリーミング状態はリセットされません。
+
+        <div id="prompt-list" class="prompt-list"></div>
+
+        <div id="surface-wrap" class="surface-wrap" hidden>
+          <div id="prompt-surface" class="prompt-surface">
+            <div class="surface-grid"></div>
+            <div id="surface-nodes"></div>
+            <button
+              id="listener"
+              class="listener"
+              title="ドラッグしてプロンプトの重みを変更"
+              aria-label="prompt mix handle"
+            ></button>
+          </div>
+          <p class="hint">
+            白いハンドルまたは色付きノードをドラッグします。距離の二乗に反比例して重みを計算します。
+          </p>
+        </div>
+
+        <div class="prompt-actions">
+          <button id="add-prompt" class="secondary">＋ プロンプトを追加</button>
+          <button id="apply" class="secondary" disabled>
+            テキスト変更をエンコード
+          </button>
+        </div>
+        <p id="prompt-hint" class="hint">
+          スライダーと2Dサーフェスの重み変更は即時反映されます。テキスト変更のみ再エンコードが必要です。
         </p>
+
         <div class="transport">
           <button id="start" class="primary">再生開始</button>
           <button id="stop" class="secondary" disabled>停止</button>
@@ -73,6 +99,6 @@
         </dl>
       </section>
     </main>
-    <script type="module" src="/static/app.js"></script>
+    <script type="module" src="/static/app.js?v=2"></script>
   </body>
 </html>

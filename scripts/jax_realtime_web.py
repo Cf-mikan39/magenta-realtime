@@ -34,9 +34,13 @@ from magenta_rt.realtime_server import FRAME_DURATION_SECONDS
 from magenta_rt.realtime_server import FRAME_RATE
 from magenta_rt.realtime_server import FRAME_SAMPLES
 from magenta_rt.realtime_server import JaxRealtimeProducer
-from magenta_rt.realtime_server import PromptConditioning
+from magenta_rt.realtime_server import MAX_PROMPTS
+from magenta_rt.realtime_server import PromptDefinition
+from magenta_rt.realtime_server import PromptMixer
+from magenta_rt.realtime_server import prompt_definitions_to_json
 from magenta_rt.realtime_server import SAMPLE_RATE
 from magenta_rt.realtime_server import validate_prompt
+from magenta_rt.realtime_server import validate_prompt_definitions
 
 
 LOGGER = logging.getLogger("jax_realtime_web")
@@ -165,7 +169,7 @@ async def _run_stream(
     await send_json(
         {
             "type": "hello",
-            "protocol_version": 1,
+            "protocol_version": 2,
             "model": model_name,
             "sample_rate": SAMPLE_RATE,
             "channels": CHANNELS,
@@ -174,6 +178,7 @@ async def _run_stream(
             "pcm_format": "float32le",
             "server_buffer_frames": buffer_frames,
             "server_prime_frames": prime_frames,
+            "max_prompts": MAX_PROMPTS,
         }
     )
     start_message = await asyncio.wait_for(
@@ -181,19 +186,24 @@ async def _run_stream(
     )
     if start_message.get("type") != "start":
       raise ValueError("the first client message must have type 'start'")
-    initial_prompt = validate_prompt(start_message.get("prompt"))
+    initial_definitions = _definitions_from_message(start_message)
 
     await send_json(
         {
             "type": "status",
             "stage": "encoding_prompt",
-            "message": "Encoding the initial prompt",
+            "message": (
+                f"Encoding {len(initial_definitions)} initial prompt(s)"
+            ),
         }
     )
-    initial_style = await asyncio.to_thread(
-        mrt.embed_style, initial_prompt, use_mapper=True, seed=0
+    embedding_cache = {}
+    initial_embeddings = await _encode_definitions(
+        mrt=mrt,
+        definitions=initial_definitions,
+        embedding_cache=embedding_cache,
     )
-    prompt = PromptConditioning(initial_prompt, initial_style)
+    prompt = PromptMixer(initial_definitions, initial_embeddings)
     ring_buffer = StereoRingBuffer(buffer_frames * FRAME_SAMPLES)
     producer = JaxRealtimeProducer(
         mrt=mrt,
@@ -215,14 +225,15 @@ async def _run_stream(
     await send_json(
         {
             "type": "stream_started",
-            "prompt": initial_prompt,
+            "prompts": prompt_definitions_to_json(initial_definitions),
             "prompt_revision": 0,
             "browser_buffer_frames": 3,
+            "browser_max_buffer_frames": 6,
         }
     )
     LOGGER.info(
-        "Browser stream started: prompt=%r, server buffer=%d frames",
-        initial_prompt,
+        "Browser stream started: prompts=%s, server buffer=%d frames",
+        [definition.text for definition in initial_definitions],
         buffer_frames,
     )
 
@@ -242,6 +253,7 @@ async def _run_stream(
             send_json=send_json,
             mrt=mrt,
             prompt=prompt,
+            embedding_cache=embedding_cache,
         ),
         name="mrt2-websocket-control-receiver",
     )
@@ -282,6 +294,8 @@ async def _send_audio(
   sequence = 0
   underrun_frames = 0
   missing_samples_total = 0
+  recovery_waits = 0
+  recovery_wait_ms_total = 0.0
   loop = asyncio.get_running_loop()
   next_deadline = loop.time()
 
@@ -294,6 +308,16 @@ async def _send_audio(
       raise producer.error
     if ring_buffer.closed and ring_buffer.available == 0:
       raise RuntimeError("JAX producer stopped unexpectedly")
+
+    if ring_buffer.available < FRAME_SAMPLES:
+      wait_started = time.perf_counter()
+      recovery_waits += 1
+      await asyncio.to_thread(
+          ring_buffer.wait_for_available, FRAME_SAMPLES, 0.02
+      )
+      recovery_wait_ms_total += (
+          time.perf_counter() - wait_started
+      ) * 1000.0
 
     samples, missing = ring_buffer.read(
         FRAME_SAMPLES, zero_pad=True, timeout=0.0
@@ -316,6 +340,8 @@ async def _send_audio(
               ),
               "server_underrun_frames": underrun_frames,
               "server_missing_samples": missing_samples_total,
+              "server_recovery_waits": recovery_waits,
+              "server_recovery_wait_ms": recovery_wait_ms_total,
               "generation_ms_latest": stats.latest_generation_ms,
               "generation_ms_mean_10s": stats.mean_generation_ms,
               "generation_ms_max": stats.max_generation_ms,
@@ -330,13 +356,65 @@ async def _send_audio(
       next_deadline = now
 
 
-async def _receive_controls(*, websocket, send_json, mrt, prompt) -> None:
+def _definitions_from_message(message) -> tuple[PromptDefinition, ...]:
+  """Read protocol-v2 prompts, retaining protocol-v1 compatibility."""
+  if "prompts" in message:
+    return validate_prompt_definitions(message.get("prompts"))
+  text = validate_prompt(message.get("prompt"))
+  return (PromptDefinition(prompt_id=0, text=text, weight=1.0),)
+
+
+async def _encode_definitions(
+    *, mrt, definitions, embedding_cache, send_json=None, request_id=None
+):
+  """Encode only unseen prompt texts and return embeddings in slot order."""
+  missing_texts = list(
+      dict.fromkeys(
+          definition.text
+          for definition in definitions
+          if definition.text not in embedding_cache
+      )
+  )
+  for index, text in enumerate(missing_texts):
+    if send_json is not None:
+      await send_json(
+          {
+              "type": "prompt_encoding_progress",
+              "prompt": text,
+              "completed": index,
+              "total": len(missing_texts),
+              "request_id": request_id,
+          }
+      )
+    embedding_cache[text] = await asyncio.to_thread(
+        mrt.embed_style, text, use_mapper=True, seed=0
+    )
+  return [embedding_cache[definition.text] for definition in definitions]
+
+
+async def _receive_controls(
+    *, websocket, send_json, mrt, prompt, embedding_cache
+) -> None:
   while True:
     message = await websocket.receive_json()
     message_type = message.get("type")
     if message_type == "stop":
       return
-    if message_type != "set_prompt":
+
+    if message_type == "set_weights":
+      try:
+        prompt.update_weights(message.get("weights"))
+      except ValueError as exc:
+        await send_json(
+            {
+                "type": "control_error",
+                "message": str(exc),
+                "request_id": message.get("request_id"),
+            }
+        )
+      continue
+
+    if message_type not in ("set_prompts", "set_prompt"):
       await send_json(
           {
               "type": "control_error",
@@ -346,7 +424,7 @@ async def _receive_controls(*, websocket, send_json, mrt, prompt) -> None:
       continue
 
     try:
-      text = validate_prompt(message.get("prompt"))
+      definitions = _definitions_from_message(message)
     except ValueError as exc:
       await send_json(
           {
@@ -360,28 +438,39 @@ async def _receive_controls(*, websocket, send_json, mrt, prompt) -> None:
     await send_json(
         {
             "type": "prompt_encoding",
-            "prompt": text,
+            "prompts": prompt_definitions_to_json(definitions),
+            "uncached_count": len(
+                {
+                    definition.text
+                    for definition in definitions
+                    if definition.text not in embedding_cache
+                }
+            ),
             "request_id": request_id,
         }
     )
     started = time.perf_counter()
-    style = await asyncio.to_thread(
-        mrt.embed_style, text, use_mapper=True, seed=0
+    embeddings = await _encode_definitions(
+        mrt=mrt,
+        definitions=definitions,
+        embedding_cache=embedding_cache,
+        send_json=send_json,
+        request_id=request_id,
     )
-    snapshot = prompt.update(text, style)
+    snapshot = prompt.configure(definitions, embeddings)
     await send_json(
         {
             "type": "prompt_applied",
-            "prompt": snapshot.text,
+            "prompts": prompt_definitions_to_json(definitions),
             "prompt_revision": snapshot.revision,
             "encoding_ms": (time.perf_counter() - started) * 1000.0,
             "request_id": request_id,
         }
     )
     LOGGER.info(
-        "Prompt revision %d applied without resetting state: %r",
+        "Prompt bank revision %d applied without resetting state: %s",
         snapshot.revision,
-        snapshot.text,
+        [definition.text for definition in definitions],
     )
 
 
@@ -400,7 +489,7 @@ def main() -> None:
   except ImportError as exc:
     raise SystemExit(
         "FastAPI server dependencies are missing. Run: "
-        "uv sync --extra jax --extra realtime"
+        'uv pip install "fastapi>=0.115" "uvicorn[standard]>=0.34"'
     ) from exc
 
   logging.basicConfig(level=logging.INFO, force=True)
