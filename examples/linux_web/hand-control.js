@@ -99,6 +99,45 @@ export function smoothStrength(previous, next, alpha = SMOOTHING_ALPHA) {
   return previous + alpha * (next - previous);
 }
 
+export function canonicalHandedness(name) {
+  const normalized = String(name ?? "").trim().toLowerCase();
+  if (normalized.includes("left")) return "left";
+  if (normalized.includes("right")) return "right";
+  return null;
+}
+
+export function hybridPromptWeights({
+  promptIds,
+  pinchTargetId,
+  pinchValue,
+  baselineWeights,
+  gestureWeights,
+}) {
+  const ids = Array.from(promptIds ?? []);
+  if (ids.length === 0) return [];
+  const positive = (values) => ids.map((_, index) => {
+    const value = Number(values?.[index]);
+    return Number.isFinite(value) ? Math.max(0, value) : 0;
+  });
+  let source = positive(gestureWeights);
+  if (source.reduce((sum, value) => sum + value, 0) <= 0) {
+    source = positive(baselineWeights);
+  }
+  if (source.reduce((sum, value) => sum + value, 0) <= 0) {
+    source = ids.map((id) => id === pinchTargetId ? 0 : 1);
+  }
+  let total = source.reduce((sum, value) => sum + value, 0);
+  if (total <= 0) {
+    source = ids.map((id) => id === pinchTargetId ? 1 : 0);
+    total = 1;
+  }
+  const pinch = clamp01(Number.isFinite(pinchValue) ? pinchValue : 0);
+  return ids.map((id, index) => (
+    (source[index] / total) * (1 - pinch)
+    + (id === pinchTargetId ? pinch : 0)
+  ));
+}
+
 function recognizedGesture(landmarks, cannedCategory) {
   const foxScore = foxGestureScore(landmarks);
   if (foxScore >= 0.58) return { name: "fox", confidence: foxScore };

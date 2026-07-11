@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MRT2 Linux Real-time</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/style.css?v=7" />
+    <link rel="stylesheet" href="/static/style.css?v=8" />
   </head>
   <body>
     <main class="shell">
@@ -241,7 +241,28 @@
               <div class="mode-switch" aria-label="hand control mode">
                 <button id="hand-pinch-mode" class="mode active">Pinch</button>
                 <button id="hand-gesture-mode" class="mode">Gesture Map</button>
+                <button id="hand-hybrid-mode" class="mode">Hybrid</button>
               </div>
+            </div>
+
+            <div id="hand-hybrid-controls" class="hand-hybrid-controls" hidden>
+              <div class="hybrid-role-row">
+                <span><b>R</b> 右手</span>
+                <select id="hand-right-role" aria-label="right hand role">
+                  <option value="gesture" selected>Gesture Map</option>
+                  <option value="pinch">Pinch</option>
+                  <option value="off">使用しない</option>
+                </select>
+              </div>
+              <div class="hybrid-role-row">
+                <span><b>L</b> 左手</span>
+                <select id="hand-left-role" aria-label="left hand role">
+                  <option value="pinch" selected>Pinch</option>
+                  <option value="gesture">Gesture Map</option>
+                  <option value="off">使用しない</option>
+                </select>
+              </div>
+              <p class="hint">左右は身体基準です。カメラ表示は鏡像になっています。</p>
             </div>
 
             <div id="hand-pinch-controls">
@@ -330,6 +351,6 @@
         </dl>
       </section>
     </main>
-    <script type="module" src="/static/app.js?v=7"></script>
+    <script type="module" src="/static/app.js?v=8"></script>
   </body>
 </html>

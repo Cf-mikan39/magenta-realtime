@@ -1,9 +1,13 @@
-import { HandPromptController } from './hand-control.js?v=7';
+import {
+  canonicalHandedness,
+  HandPromptController,
+  hybridPromptWeights,
+} from './hand-control.js?v=8';
 import {
   lfoValue,
   mapModulationRange,
   midiCcValue,
-} from './modulation.js?v=7';
+} from './modulation.js?v=8';
 
 const COLORS = ['#9b8cff', '#4ed6b2', '#ffb95e', '#ff7891', '#64b5ff', '#d98cff'];
 const MAX_PROMPTS = 6;
@@ -81,6 +85,10 @@ const elements = {
   handInvert: document.querySelector('#hand-invert'),
   handPinchMode: document.querySelector('#hand-pinch-mode'),
   handGestureMode: document.querySelector('#hand-gesture-mode'),
+  handHybridMode: document.querySelector('#hand-hybrid-mode'),
+  handHybridControls: document.querySelector('#hand-hybrid-controls'),
+  handRightRole: document.querySelector('#hand-right-role'),
+  handLeftRole: document.querySelector('#hand-left-role'),
   handPinchControls: document.querySelector('#hand-pinch-controls'),
   handGestureMap: document.querySelector('#hand-gesture-map'),
   gestureVictory: document.querySelector('#gesture-victory'),
@@ -124,6 +132,7 @@ const pressedComputerKeys = new Map();
 let handActive = false;
 let handBaseline = new Map();
 let handControlMode = 'pinch';
+let hybridPinchValue = null;
 const gestureStates = new Map();
 let lfoTimer = null;
 let lfoStartedAt = performance.now();
@@ -569,6 +578,10 @@ function applyHandFrame({ hands }) {
     applyGestureFrame(hands);
     return;
   }
+  if (handControlMode === 'hybrid') {
+    applyHybridFrame(hands);
+    return;
+  }
   const hand = hands[0];
   const strength = hand?.pinchStrength;
   if (strength === null || !Number.isFinite(strength)) return;
@@ -586,7 +599,7 @@ function applyHandFrame({ hands }) {
   scheduleWeightUpdate();
 }
 
-function applyGestureFrame(hands, now = performance.now()) {
+function updateGestureStates(hands, now) {
   const seenHands = new Set();
   for (const hand of hands) {
     const key = hand.handedness;
@@ -630,15 +643,13 @@ function applyGestureFrame(hands, now = performance.now()) {
       }
     }
   }
+}
 
-  const activeHands = [...gestureStates.entries()]
-    .filter(([, state]) => state.active !== null);
-  if (activeHands.length === 0) {
-    elements.handStrength.textContent = '—';
-    elements.handMeterFill.style.width = '0%';
-    return;
-  }
+function activeGestureHands() {
+  return [...gestureStates.entries()].filter(([, state]) => state.active !== null);
+}
 
+function gestureWeightMap(activeHands) {
   const contributions = new Map();
   for (const [, state] of activeHands) {
     const select = gestureSelects[state.active];
@@ -648,19 +659,84 @@ function applyGestureFrame(hands, now = performance.now()) {
       Math.max(contributions.get(promptId) ?? 0, state.confidence),
     );
   }
+  return contributions;
+}
+
+function gestureDescriptions(activeHands) {
+  return activeHands.map(([hand, state]) => {
+    const label = GESTURES.find(({ name }) => name === state.active)?.label;
+    return `${hand}: ${label} ${Math.round(state.confidence * 100)}%`;
+  });
+}
+
+function applyGestureFrame(hands, now = performance.now()) {
+  updateGestureStates(hands, now);
+  const activeHands = activeGestureHands();
+  if (activeHands.length === 0) {
+    elements.handStrength.textContent = '—';
+    elements.handMeterFill.style.width = '0%';
+    return;
+  }
+
+  const contributions = gestureWeightMap(activeHands);
   const total = [...contributions.values()].reduce((sum, value) => sum + value, 0);
   if (total <= 0) return;
   for (const prompt of prompts) {
     prompt.weight = (contributions.get(prompt.id) ?? 0) / total;
   }
 
-  const descriptions = activeHands.map(([hand, state]) => {
-    const label = GESTURES.find(({ name }) => name === state.active)?.label;
-    return `${hand}: ${label} ${Math.round(state.confidence * 100)}%`;
-  });
-  elements.handStatus.textContent = descriptions.join(' · ');
+  elements.handStatus.textContent = gestureDescriptions(activeHands).join(' · ');
   elements.handStrength.textContent = `${activeHands.length} hand`;
   elements.handMeterFill.style.width = `${Math.min(100, activeHands.length * 50)}%`;
+  updateWeightDisplays();
+  scheduleWeightUpdate();
+}
+
+function hybridRoleForHand(hand) {
+  const side = canonicalHandedness(hand.handedness);
+  if (side === 'right') return elements.handRightRole.value;
+  if (side === 'left') return elements.handLeftRole.value;
+  return 'off';
+}
+
+function applyHybridFrame(hands, now = performance.now()) {
+  const gestureHands = hands.filter((hand) => hybridRoleForHand(hand) === 'gesture');
+  const pinchHands = hands.filter((hand) => (
+    hybridRoleForHand(hand) === 'pinch'
+    && Number.isFinite(hand.pinchStrength)
+  ));
+  updateGestureStates(gestureHands, now);
+  if (pinchHands.length > 0) {
+    hybridPinchValue = pinchHands.reduce(
+      (sum, hand) => sum + hand.pinchStrength,
+      0,
+    ) / pinchHands.length;
+  }
+  if (!Number.isFinite(hybridPinchValue)) return;
+
+  const activeHands = activeGestureHands();
+  const contributions = gestureWeightMap(activeHands);
+  const targetId = Number(elements.handPrompt.value);
+  const weights = hybridPromptWeights({
+    promptIds: prompts.map((prompt) => prompt.id),
+    pinchTargetId: targetId,
+    pinchValue: hybridPinchValue,
+    baselineWeights: prompts.map((prompt) => handBaseline.get(prompt.id) ?? 0),
+    gestureWeights: prompts.map((prompt) => contributions.get(prompt.id) ?? 0),
+  });
+  prompts.forEach((prompt, index) => { prompt.weight = weights[index]; });
+
+  const descriptions = gestureDescriptions(activeHands);
+  descriptions.push(...pinchHands.map((hand) => (
+    `${hand.handedness}: Pinch ${Math.round(hand.pinchStrength * 100)}%`
+  )));
+  if (hands.length > 0) {
+    elements.handStatus.textContent = descriptions.length > 0
+      ? descriptions.join(' · ')
+      : '認識した手は「使用しない」に設定されています。';
+  }
+  elements.handStrength.textContent = `${Math.round(hybridPinchValue * 100)}%`;
+  elements.handMeterFill.style.width = `${hybridPinchValue * 100}%`;
   updateWeightDisplays();
   scheduleWeightUpdate();
 }
@@ -668,17 +744,26 @@ function applyGestureFrame(hands, now = performance.now()) {
 function setHandControlMode(mode) {
   handControlMode = mode;
   const gestureMode = mode === 'gesture';
+  const hybridMode = mode === 'hybrid';
   elements.handPinchControls.hidden = gestureMode;
-  elements.handGestureMap.hidden = !gestureMode;
-  elements.handPinchMode.classList.toggle('active', !gestureMode);
+  elements.handGestureMap.hidden = mode === 'pinch';
+  elements.handHybridControls.hidden = !hybridMode;
+  elements.handPinchMode.classList.toggle('active', mode === 'pinch');
   elements.handGestureMode.classList.toggle('active', gestureMode);
-  elements.handMeterLabel.textContent = gestureMode
-    ? 'Active gestures'
-    : 'Prompt strength';
-  elements.handControlHint.textContent = gestureMode
-    ? 'ジェスチャーを2フレーム連続で認識すると適用し、短い見失いでは直前の状態を保持します。'
-    : '親指と人差し指を閉じると0%、広げると100%。選択したプロンプト以外の比率を保ったまま連続制御します。';
+  elements.handHybridMode.classList.toggle('active', hybridMode);
+  elements.handMeterLabel.textContent = gestureMode ? 'Active gestures' : 'Prompt strength';
+  const hints = {
+    pinch: '親指と人差し指を閉じると0%、広げると100%。選択したプロンプト以外の比率を保ったまま連続制御します。',
+    gesture: 'ジェスチャーを2フレーム連続で認識すると適用し、短い見失いでは直前の状態を保持します。',
+    hybrid: 'Pinchが選択プロンプトの比率を決め、Gesture Mapが残りをブレンドします。左右の役割は上で入れ替えられます。',
+  };
+  elements.handControlHint.textContent = hints[mode];
   gestureStates.clear();
+  hybridPinchValue = hybridMode
+    ? Math.max(0, Math.min(1, prompts.find(
+      (prompt) => prompt.id === Number(elements.handPrompt.value),
+    )?.weight ?? 0))
+    : null;
   elements.handStrength.textContent = '—';
   elements.handMeterFill.style.width = '0%';
   if (!gestureMode) captureHandBaseline();
@@ -939,7 +1024,7 @@ async function createAudioPlayer() {
       `AudioContextが48 kHzではありません (${actualSampleRate} Hz)。`,
     );
   }
-  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=7');
+  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=8');
   playerNode = new AudioWorkletNode(audioContext, 'mrt2-pcm-player', {
     numberOfInputs: 0,
     numberOfOutputs: 1,
@@ -1208,9 +1293,23 @@ elements.ccNumber.addEventListener('change', () => updateCcHint());
 elements.ccLearn.addEventListener('click', beginCcLearn);
 elements.midiPanic.addEventListener('click', allNotesOff);
 elements.handEnable.addEventListener('click', toggleHandControl);
-elements.handPrompt.addEventListener('change', captureHandBaseline);
+elements.handPrompt.addEventListener('change', () => {
+  captureHandBaseline();
+  if (handControlMode === 'hybrid') {
+    hybridPinchValue = Math.max(0, Math.min(1, prompts.find(
+      (prompt) => prompt.id === Number(elements.handPrompt.value),
+    )?.weight ?? 0));
+  }
+});
 elements.handPinchMode.addEventListener('click', () => setHandControlMode('pinch'));
 elements.handGestureMode.addEventListener('click', () => setHandControlMode('gesture'));
+elements.handHybridMode.addEventListener('click', () => setHandControlMode('hybrid'));
+elements.handRightRole.addEventListener('change', () => {
+  if (handControlMode === 'hybrid') setHandControlMode('hybrid');
+});
+elements.handLeftRole.addEventListener('change', () => {
+  if (handControlMode === 'hybrid') setHandControlMode('hybrid');
+});
 elements.octaveDown.addEventListener('click', () => {
   keyboardBaseNote = Math.max(24, keyboardBaseNote - 12);
   updateMidiUi();

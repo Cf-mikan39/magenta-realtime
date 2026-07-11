@@ -610,6 +610,28 @@ button.mini-button {
 
 .hand-invert { margin-top: 15px; }
 
+.hand-hybrid-controls[hidden] { display: none; }
+
+.hand-hybrid-controls {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid #303641;
+  border-radius: 12px;
+  background: #10141b;
+}
+
+.hybrid-role-row {
+  display: grid;
+  grid-template-columns: minmax(112px, 0.7fr) minmax(160px, 1.3fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.hybrid-role-row > span { color: #cbd0d9; font-size: 12px; font-weight: 700; }
+.hybrid-role-row b { color: #78f2be; }
+
 .hand-gesture-map[hidden] { display: none; }
 
 .hand-gesture-map {
@@ -718,6 +740,7 @@ dd { margin: 5px 0 0; font-size: 13px; font-variant-numeric: tabular-nums; }
   .hand-layout { grid-template-columns: 1fr; }
   .hand-toolbar { align-items: stretch; flex-direction: column; }
   .hand-device-row { grid-template-columns: 1fr; }
+  .hybrid-role-row { grid-template-columns: 1fr; }
   .gesture-map-row { grid-template-columns: 1fr; }
   dl { grid-template-columns: 1fr; }
 }

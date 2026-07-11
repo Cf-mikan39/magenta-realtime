@@ -89,19 +89,28 @@ predictable modulation.
 ## Hand landmark and gesture control
 
 The hand controller runs entirely in the local browser and does not upload
-camera frames to the GPU server. It has two modes:
+camera frames to the GPU server. It has three modes:
 
 - **Pinch** maps the normalized thumb/index distance to one prompt. A closed
   pinch is 0% and a wide spread is 100%; **Invert** reverses the mapping.
 - **Gesture Map** assigns Victory/peace, Open Palm, Fox, and Closed Fist to
   prompt slots. MediaPipe's canned recognizer handles all but Fox; Fox is
   classified from finger extension and thumb-contact landmarks.
+- **Hybrid** assigns Pinch, Gesture Map, or Off independently to the anatomical
+  right and left hands. It defaults to right-hand Gesture Map plus left-hand
+  Pinch. Pinch sets its prompt's share and active gestures blend the remaining
+  share; the roles can be swapped when camera handedness is inconvenient.
 
 Gesture Map tracks up to two hands. Two different simultaneous gestures blend
 their assigned prompts using smoothed recognition confidence. Recognition must
 persist for two frames before switching, and the last recognized gesture is
 held for 320 ms through brief tracking loss. Detection is limited to about
 15 fps, independently of the audio-generation loop.
+
+In Hybrid mode, avoid assigning the Pinch target and every gesture to the same
+prompt: that is mathematically a 100% single-prompt mix and the Pinch movement
+will not be audible. The camera preview is mirrored, while the left/right labels
+refer to the performer's anatomical hands.
 
 The first launch downloads the pinned MediaPipe Tasks Vision runtime and the
 official Gesture Recognizer model in the browser. Camera access requires

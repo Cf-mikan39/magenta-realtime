@@ -3,7 +3,9 @@
 
 import assert from 'node:assert/strict';
 import {
+  canonicalHandedness,
   foxGestureScore,
+  hybridPromptWeights,
   pinchStrength,
   smoothStrength,
 } from '../examples/linux_web/hand-control.js';
@@ -22,6 +24,28 @@ assert.equal(pinchStrength(landmarksWithPinchDistance(0.18), true), 1);
 assert.equal(pinchStrength([], false), null);
 assert.equal(smoothStrength(null, 0.75), 0.75);
 assert.equal(smoothStrength(0, 1, 0.25), 0.25);
+assert.equal(canonicalHandedness('Right'), 'right');
+assert.equal(canonicalHandedness('LEFT hand'), 'left');
+assert.equal(canonicalHandedness('unknown'), null);
+
+const hybrid = hybridPromptWeights({
+  promptIds: [10, 20, 30],
+  pinchTargetId: 10,
+  pinchValue: 0.25,
+  baselineWeights: [0, 0.5, 0.5],
+  gestureWeights: [0, 0, 1],
+});
+assert.deepEqual(hybrid, [0.25, 0, 0.75]);
+assert.equal(hybrid.reduce((sum, value) => sum + value, 0), 1);
+
+const hybridFallback = hybridPromptWeights({
+  promptIds: [10, 20],
+  pinchTargetId: 10,
+  pinchValue: 0.6,
+  baselineWeights: [0, 1],
+  gestureWeights: [0, 0],
+});
+assert.deepEqual(hybridFallback, [0.6, 0.4]);
 
 function foxLandmarks() {
   const points = Array.from({ length: 21 }, () => ({ x: 0.5, y: 0.75, z: 0 }));
