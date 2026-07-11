@@ -61,6 +61,13 @@ is observed for one frame.
 The PC keyboard mapping follows the official app: A/W/S/E/D/F/T/G/Y/H/U/J
 starts at C3, K/O/L/P/; continues above it, and Z/X changes octave.
 
+## Drum conditioning
+
+**No Drums** matches the native app's drumless switch. Off leaves the single
+drum-conditioning token masked (`-1`), allowing the model to decide. On sends
+token `0` every 40 ms frame, encouraging drum-free generation. Switching does
+not reset the recurrent streaming state or re-encode prompts.
+
 ## Hand landmark and gesture control
 
 The hand controller runs entirely in the local browser and does not upload

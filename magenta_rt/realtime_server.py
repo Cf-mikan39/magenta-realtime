@@ -281,6 +281,47 @@ class MidiConditioning:
         revision=self._revision,
     )
 
+
+@dataclass(frozen=True)
+class DrumSnapshot:
+  """Current drum-conditioning switch state."""
+
+  no_drums: bool
+  revision: int
+
+
+class DrumConditioning:
+  """Atomically expose the native app's No Drums conditioning token."""
+
+  def __init__(self, *, no_drums: bool = False):
+    self._no_drums = bool(no_drums)
+    self._revision = 0
+    self._lock = threading.Lock()
+
+  def configure(self, *, no_drums: object) -> DrumSnapshot:
+    if not isinstance(no_drums, bool):
+      raise ValueError("No Drums must be a boolean")
+    with self._lock:
+      self._no_drums = no_drums
+      self._revision += 1
+      return self._snapshot_locked()
+
+  def snapshot(self) -> DrumSnapshot:
+    with self._lock:
+      return self._snapshot_locked()
+
+  def frame_tokens(self) -> list[int] | None:
+    """Return token 0 when suppressed, otherwise leave drums masked."""
+    with self._lock:
+      return [0] if self._no_drums else None
+
+  def _snapshot_locked(self) -> DrumSnapshot:
+    return DrumSnapshot(
+        no_drums=self._no_drums,
+        revision=self._revision,
+    )
+
+
 @dataclass(frozen=True)
 class ProducerStats:
   """A consistent snapshot of inference-thread timing counters."""
@@ -303,6 +344,7 @@ class JaxRealtimeProducer(threading.Thread):
       prompt: PromptConditioning | PromptMixer,
       ring_buffer: StereoRingBuffer,
       midi: MidiConditioning | None = None,
+      drums: DrumConditioning | None = None,
       logger: logging.Logger | None = None,
   ):
     super().__init__(name="mrt2-jax-web-producer", daemon=True)
@@ -310,6 +352,7 @@ class JaxRealtimeProducer(threading.Thread):
     self._prompt = prompt
     self._ring_buffer = ring_buffer
     self._midi = midi
+    self._drums = drums
     self._logger = logger or logging.getLogger(__name__)
     self._stop_event = threading.Event()
     self._stats_lock = threading.Lock()
@@ -357,6 +400,10 @@ class JaxRealtimeProducer(threading.Thread):
           notes = self._midi.frame_tokens()
           if notes is not None:
             generate_kwargs["notes"] = notes
+        if self._drums is not None:
+          drums = self._drums.frame_tokens()
+          if drums is not None:
+            generate_kwargs["drums"] = drums
         waveform, state = self._mrt.generate(**generate_kwargs)
         generation_ms = (time.perf_counter() - step_start) * 1000.0
         samples = validate_audio_frame(waveform)

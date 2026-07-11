@@ -31,6 +31,7 @@ from magenta_rt.live_compat import APPLE_LIVE_MUSICCOCA_MASKED_TAIL_LEVELS
 from magenta_rt.realtime import StereoRingBuffer
 from magenta_rt.realtime_server import CHANNELS
 from magenta_rt.realtime_server import encode_pcm_f32le
+from magenta_rt.realtime_server import DrumConditioning
 from magenta_rt.realtime_server import FRAME_DURATION_SECONDS
 from magenta_rt.realtime_server import FRAME_RATE
 from magenta_rt.realtime_server import FRAME_SAMPLES
@@ -243,12 +244,14 @@ async def _run_stream(
     )
     prompt = PromptMixer(initial_definitions, initial_embeddings)
     midi = MidiConditioning()
+    drums = DrumConditioning()
     ring_buffer = StereoRingBuffer(buffer_frames * FRAME_SAMPLES)
     producer = JaxRealtimeProducer(
         mrt=mrt,
         prompt=prompt,
         ring_buffer=ring_buffer,
         midi=midi,
+        drums=drums,
         logger=LOGGER,
     )
     producer.start()
@@ -274,6 +277,7 @@ async def _run_stream(
                 "auto_strum": True,
                 "unmask_width": 4,
             },
+            "drums": {"no_drums": False},
         }
     )
     LOGGER.info(
@@ -290,6 +294,7 @@ async def _run_stream(
             ring_buffer=ring_buffer,
             producer=producer,
             midi=midi,
+            drums=drums,
         ),
         name="mrt2-websocket-audio-sender",
     )
@@ -301,6 +306,7 @@ async def _run_stream(
             prompt=prompt,
             embedding_cache=embedding_cache,
             midi=midi,
+            drums=drums,
         ),
         name="mrt2-websocket-control-receiver",
     )
@@ -336,7 +342,7 @@ async def _run_stream(
 
 
 async def _send_audio(
-    *, websocket, send_lock, send_json, ring_buffer, producer, midi
+    *, websocket, send_lock, send_json, ring_buffer, producer, midi, drums
 ) -> None:
   sequence = 0
   underrun_frames = 0
@@ -379,6 +385,7 @@ async def _send_audio(
     if sequence % FRAME_RATE == 0:
       stats = producer.stats()
       midi_stats = midi.snapshot()
+      drum_stats = drums.snapshot()
       await send_json(
           {
               "type": "metrics",
@@ -398,6 +405,8 @@ async def _send_audio(
               "midi_enabled": midi_stats.enabled,
               "midi_active_notes": list(midi_stats.active_notes),
               "midi_revision": midi_stats.revision,
+              "no_drums": drum_stats.no_drums,
+              "drum_revision": drum_stats.revision,
           }
       )
 
@@ -444,7 +453,7 @@ async def _encode_definitions(
 
 
 async def _receive_controls(
-    *, websocket, send_json, mrt, prompt, embedding_cache, midi
+    *, websocket, send_json, mrt, prompt, embedding_cache, midi, drums
 ) -> None:
   while True:
     message = await websocket.receive_json()
@@ -471,6 +480,29 @@ async def _receive_controls(
               "auto_strum": midi_snapshot.auto_strum,
               "unmask_width": midi_snapshot.unmask_width,
           }
+      )
+      continue
+
+    if message_type == "drum_config":
+      try:
+        drum_snapshot = drums.configure(
+            no_drums=message.get("no_drums")
+        )
+      except ValueError as exc:
+        await send_json(
+            {"type": "control_error", "message": str(exc)}
+        )
+        continue
+      await send_json(
+          {
+              "type": "drum_config_applied",
+              "no_drums": drum_snapshot.no_drums,
+              "drum_revision": drum_snapshot.revision,
+          }
+      )
+      LOGGER.info(
+          "No Drums %s without resetting streaming state",
+          "enabled" if drum_snapshot.no_drums else "disabled",
       )
       continue
 

@@ -1,4 +1,4 @@
-import { HandPromptController } from './hand-control.js?v=5';
+import { HandPromptController } from './hand-control.js?v=6';
 
 const COLORS = ['#9b8cff', '#4ed6b2', '#ffb95e', '#ff7891', '#64b5ff', '#d98cff'];
 const MAX_PROMPTS = 6;
@@ -44,6 +44,7 @@ const elements = {
   computerKeyboard: document.querySelector('#computer-keyboard'),
   autoStrum: document.querySelector('#auto-strum'),
   midiSolo: document.querySelector('#midi-solo'),
+  noDrums: document.querySelector('#no-drums'),
   midiPanic: document.querySelector('#midi-panic'),
   midiLed: document.querySelector('#midi-led'),
   midiStatus: document.querySelector('#midi-status'),
@@ -607,6 +608,14 @@ function sendMidiConfig() {
   }));
 }
 
+function sendDrumConfig() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({
+    type: 'drum_config',
+    no_drums: elements.noDrums.checked,
+  }));
+}
+
 function sendMidiNote(pitch, on) {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   socket.send(JSON.stringify({ type: 'midi_note', pitch, on }));
@@ -789,7 +798,7 @@ async function createAudioPlayer() {
       `AudioContextが48 kHzではありません (${actualSampleRate} Hz)。`,
     );
   }
-  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=5');
+  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=6');
   playerNode = new AudioWorkletNode(audioContext, 'mrt2-pcm-player', {
     numberOfInputs: 0,
     numberOfOutputs: 1,
@@ -851,6 +860,7 @@ function handleControlMessage(message) {
       bankDirty = false;
       setControls(true);
       sendMidiConfig();
+      sendDrumConfig();
       for (const pitch of activeMidiNotes) sendMidiNote(pitch, true);
       elements.revision.textContent = message.prompt_revision;
       elements.promptHint.textContent =
@@ -885,6 +895,9 @@ function handleControlMessage(message) {
       break;
     case 'midi_config_applied':
       updateMidiUi();
+      break;
+    case 'drum_config_applied':
+      elements.noDrums.checked = message.no_drums;
       break;
     case 'metrics':
       elements.generationMs.textContent =
@@ -1032,6 +1045,7 @@ elements.computerKeyboard.addEventListener('change', () => {
 });
 elements.autoStrum.addEventListener('change', sendMidiConfig);
 elements.midiSolo.addEventListener('change', sendMidiConfig);
+elements.noDrums.addEventListener('change', sendDrumConfig);
 elements.midiPanic.addEventListener('click', allNotesOff);
 elements.handEnable.addEventListener('click', toggleHandControl);
 elements.handPrompt.addEventListener('change', captureHandBaseline);

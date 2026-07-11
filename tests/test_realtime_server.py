@@ -21,6 +21,7 @@ import numpy as np
 
 from magenta_rt.realtime import StereoRingBuffer
 from magenta_rt.realtime_server import blend_style_embeddings
+from magenta_rt.realtime_server import DrumConditioning
 from magenta_rt.realtime_server import encode_pcm_f32le
 from magenta_rt.realtime_server import FRAME_SAMPLES
 from magenta_rt.realtime_server import JaxRealtimeProducer
@@ -48,10 +49,12 @@ class _FakeMrt:
   def __init__(self):
     self.states = []
     self.notes = []
+    self.drums = []
 
-  def generate(self, *, style, frames, state, notes=None):
+  def generate(self, *, style, frames, state, notes=None, drums=None):
     self.states.append(state)
     self.notes.append(notes)
+    self.drums.append(drums)
     next_state = 1 if state is None else state + 1
     return _FakeWaveform(float(style)), next_state
 
@@ -193,6 +196,39 @@ class MidiConditioningTest(unittest.TestCase):
     producer.stop()
     producer.join(timeout=1.0)
     self.assertEqual(mrt.notes[0][72], 2)
+
+
+class DrumConditioningTest(unittest.TestCase):
+
+  def test_no_drums_switch_emits_off_token(self):
+    drums = DrumConditioning()
+    self.assertIsNone(drums.frame_tokens())
+    snapshot = drums.configure(no_drums=True)
+    self.assertTrue(snapshot.no_drums)
+    self.assertEqual(snapshot.revision, 1)
+    self.assertEqual(drums.frame_tokens(), [0])
+    drums.configure(no_drums=False)
+    self.assertIsNone(drums.frame_tokens())
+
+  def test_rejects_non_boolean_configuration(self):
+    with self.assertRaises(ValueError):
+      DrumConditioning().configure(no_drums=1)
+
+  def test_producer_passes_drum_token_to_model(self):
+    mrt = _FakeMrt()
+    drums = DrumConditioning(no_drums=True)
+    ring = StereoRingBuffer(FRAME_SAMPLES)
+    producer = JaxRealtimeProducer(
+        mrt=mrt,
+        prompt=PromptConditioning("one", 0.5),
+        ring_buffer=ring,
+        drums=drums,
+    )
+    producer.start()
+    self.assertTrue(ring.wait_for_available(FRAME_SAMPLES, timeout=1.0))
+    producer.stop()
+    producer.join(timeout=1.0)
+    self.assertEqual(mrt.drums[0], [0])
 
 
 class PcmEncodingTest(unittest.TestCase):
