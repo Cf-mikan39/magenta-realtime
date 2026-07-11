@@ -1,8 +1,14 @@
-import { HandPromptController } from './hand-control.js?v=6';
+import { HandPromptController } from './hand-control.js?v=7';
+import {
+  lfoValue,
+  mapModulationRange,
+  midiCcValue,
+} from './modulation.js?v=7';
 
 const COLORS = ['#9b8cff', '#4ed6b2', '#ffb95e', '#ff7891', '#64b5ff', '#d98cff'];
 const MAX_PROMPTS = 6;
 const WEIGHT_SEND_INTERVAL_MS = 40;
+const MODULATION_INTERVAL_MS = 40;
 const GESTURE_CONFIRM_FRAMES = 2;
 const GESTURE_HOLD_MS = 320;
 const GESTURES = [
@@ -45,6 +51,24 @@ const elements = {
   autoStrum: document.querySelector('#auto-strum'),
   midiSolo: document.querySelector('#midi-solo'),
   noDrums: document.querySelector('#no-drums'),
+  lfoEnable: document.querySelector('#lfo-enable'),
+  lfoTarget: document.querySelector('#lfo-target'),
+  lfoWaveform: document.querySelector('#lfo-waveform'),
+  lfoRate: document.querySelector('#lfo-rate'),
+  lfoRateValue: document.querySelector('#lfo-rate-value'),
+  lfoMin: document.querySelector('#lfo-min'),
+  lfoMinValue: document.querySelector('#lfo-min-value'),
+  lfoMax: document.querySelector('#lfo-max'),
+  lfoMaxValue: document.querySelector('#lfo-max-value'),
+  lfoCurrent: document.querySelector('#lfo-current'),
+  ccEnable: document.querySelector('#cc-enable'),
+  ccTarget: document.querySelector('#cc-target'),
+  ccNumber: document.querySelector('#cc-number'),
+  ccLearn: document.querySelector('#cc-learn'),
+  ccInvert: document.querySelector('#cc-invert'),
+  ccCurrent: document.querySelector('#cc-current'),
+  ccMeterFill: document.querySelector('#cc-meter-fill'),
+  ccHint: document.querySelector('#cc-hint'),
   midiPanic: document.querySelector('#midi-panic'),
   midiLed: document.querySelector('#midi-led'),
   midiStatus: document.querySelector('#midi-status'),
@@ -101,6 +125,9 @@ let handActive = false;
 let handBaseline = new Map();
 let handControlMode = 'pinch';
 const gestureStates = new Map();
+let lfoTimer = null;
+let lfoStartedAt = performance.now();
+let ccLearning = false;
 const gestureSelects = {
   victory: elements.gestureVictory,
   open_palm: elements.gestureOpenPalm,
@@ -378,6 +405,108 @@ function scheduleWeightUpdate() {
   }, WEIGHT_SEND_INTERVAL_MS);
 }
 
+function applyModulatedWeight(promptId, value) {
+  const target = prompts.find((prompt) => prompt.id === promptId);
+  if (!target) return;
+  target.weight = Math.max(0, Math.min(1, value));
+  if (prompts.every((prompt) => prompt.weight <= 0)) {
+    const fallback = prompts.find((prompt) => prompt.id !== promptId);
+    if (fallback) fallback.weight = 1;
+    else target.weight = 0.001;
+  }
+  updateWeightDisplays();
+  scheduleWeightUpdate();
+}
+
+function syncLfoControls(changed = null) {
+  let minValue = Number(elements.lfoMin.value);
+  let maxValue = Number(elements.lfoMax.value);
+  if (minValue > maxValue) {
+    if (changed === 'min') {
+      maxValue = minValue;
+      elements.lfoMax.value = String(maxValue);
+    } else {
+      minValue = maxValue;
+      elements.lfoMin.value = String(minValue);
+    }
+  }
+  elements.lfoRateValue.textContent = `${Number(elements.lfoRate.value).toFixed(2)} Hz`;
+  elements.lfoMinValue.textContent = `${Math.round(minValue * 100)}%`;
+  elements.lfoMaxValue.textContent = `${Math.round(maxValue * 100)}%`;
+}
+
+function runLfoFrame() {
+  const rate = Number(elements.lfoRate.value);
+  const phase = ((performance.now() - lfoStartedAt) / 1000 * rate) % 1;
+  const unit = lfoValue(elements.lfoWaveform.value, phase);
+  const value = mapModulationRange(
+    unit,
+    Number(elements.lfoMin.value),
+    Number(elements.lfoMax.value),
+  );
+  elements.lfoCurrent.textContent = `${Math.round(value * 100)}%`;
+  applyModulatedWeight(Number(elements.lfoTarget.value), value);
+}
+
+function setLfoEnabled(enabled) {
+  elements.lfoEnable.checked = enabled;
+  if (lfoTimer !== null) {
+    window.clearInterval(lfoTimer);
+    lfoTimer = null;
+  }
+  if (!enabled) {
+    elements.lfoCurrent.textContent = '—';
+    return;
+  }
+  lfoStartedAt = performance.now();
+  runLfoFrame();
+  lfoTimer = window.setInterval(runLfoFrame, MODULATION_INTERVAL_MS);
+}
+
+function configuredCcNumber() {
+  const value = Math.max(
+    0,
+    Math.min(119, Math.round(Number(elements.ccNumber.value) || 0)),
+  );
+  elements.ccNumber.value = String(value);
+  return value;
+}
+
+function updateCcHint(message = null) {
+  if (message) {
+    elements.ccHint.textContent = message;
+    return;
+  }
+  const number = configuredCcNumber();
+  elements.ccHint.textContent = elements.ccEnable.checked
+    ? `選択中のMIDI入力からCC ${number}を受信するとプロンプトを変調します。`
+    : `MIDI CC変調は停止中です（割り当て: CC ${number}）。`;
+}
+
+function beginCcLearn() {
+  ccLearning = !ccLearning;
+  elements.ccLearn.textContent = ccLearning ? 'Move a knob…' : 'Learn';
+  updateCcHint(
+    ccLearning
+      ? '割り当てたいMIDIコントローラーを動かしてください。'
+      : null,
+  );
+}
+
+function handleMidiCc(controller, rawValue) {
+  if (ccLearning && controller <= 119) {
+    elements.ccNumber.value = String(controller);
+    ccLearning = false;
+    elements.ccLearn.textContent = 'Learn';
+    updateCcHint(`CC ${controller}を割り当てました。`);
+  }
+  if (!elements.ccEnable.checked || controller !== configuredCcNumber()) return;
+  const value = midiCcValue(rawValue, elements.ccInvert.checked);
+  elements.ccCurrent.textContent = `CC${controller} · ${Math.round(value * 100)}%`;
+  elements.ccMeterFill.style.width = `${value * 100}%`;
+  applyModulatedWeight(Number(elements.ccTarget.value), value);
+}
+
 function renderHandPromptOptions() {
   const previousId = Number(elements.handPrompt.value);
   populatePromptSelect(elements.handPrompt, previousId, 0);
@@ -386,6 +515,15 @@ function renderHandPromptOptions() {
     const selectedId = select.options.length > 0 ? Number(select.value) : NaN;
     populatePromptSelect(select, selectedId, index % prompts.length);
   });
+  const lfoTargetId = elements.lfoTarget.options.length > 0
+    ? Number(elements.lfoTarget.value)
+    : NaN;
+  const ccTargetId = elements.ccTarget.options.length > 0
+    ? Number(elements.ccTarget.value)
+    : NaN;
+  const modulationDefault = Math.min(1, prompts.length - 1);
+  populatePromptSelect(elements.lfoTarget, lfoTargetId, modulationDefault);
+  populatePromptSelect(elements.ccTarget, ccTargetId, modulationDefault);
   elements.handPrompt.disabled = prompts.length < 2;
   elements.handEnable.disabled = prompts.length < 2;
   if (prompts.length < 2 && handActive) {
@@ -739,10 +877,13 @@ function handleMidiMessage(event) {
     midiNoteOn(data1);
   } else if (status === 0x80 || (status === 0x90 && data2 === 0)) {
     midiNoteOff(data1);
-  } else if (status === 0xb0 && data1 === 64) {
-    setSustain(data2 >= 64);
-  } else if (status === 0xb0 && (data1 === 120 || data1 === 123)) {
-    allNotesOff();
+  } else if (status === 0xb0) {
+    handleMidiCc(data1, data2);
+    if (data1 === 64) {
+      setSustain(data2 >= 64);
+    } else if (data1 === 120 || data1 === 123) {
+      allNotesOff();
+    }
   }
 }
 
@@ -798,7 +939,7 @@ async function createAudioPlayer() {
       `AudioContextが48 kHzではありません (${actualSampleRate} Hz)。`,
     );
   }
-  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=6');
+  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=7');
   playerNode = new AudioWorkletNode(audioContext, 'mrt2-pcm-player', {
     numberOfInputs: 0,
     numberOfOutputs: 1,
@@ -1046,6 +1187,25 @@ elements.computerKeyboard.addEventListener('change', () => {
 elements.autoStrum.addEventListener('change', sendMidiConfig);
 elements.midiSolo.addEventListener('change', sendMidiConfig);
 elements.noDrums.addEventListener('change', sendDrumConfig);
+elements.lfoEnable.addEventListener('change', () => {
+  setLfoEnabled(elements.lfoEnable.checked);
+});
+elements.lfoWaveform.addEventListener('change', () => {
+  lfoStartedAt = performance.now();
+  if (elements.lfoEnable.checked) runLfoFrame();
+});
+elements.lfoRate.addEventListener('input', () => syncLfoControls());
+elements.lfoMin.addEventListener('input', () => syncLfoControls('min'));
+elements.lfoMax.addEventListener('input', () => syncLfoControls('max'));
+elements.ccEnable.addEventListener('change', () => {
+  if (!elements.ccEnable.checked) {
+    elements.ccCurrent.textContent = '—';
+    elements.ccMeterFill.style.width = '0%';
+  }
+  updateCcHint();
+});
+elements.ccNumber.addEventListener('change', () => updateCcHint());
+elements.ccLearn.addEventListener('click', beginCcLearn);
 elements.midiPanic.addEventListener('click', allNotesOff);
 elements.handEnable.addEventListener('click', toggleHandControl);
 elements.handPrompt.addEventListener('change', captureHandBaseline);
@@ -1081,3 +1241,5 @@ setMixMode('list');
 setHandControlMode('pinch');
 setControls(false);
 updateMidiUi();
+syncLfoControls();
+updateCcHint();

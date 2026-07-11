@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MRT2 Linux Real-time</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/style.css?v=6" />
+    <link rel="stylesheet" href="/static/style.css?v=7" />
   </head>
   <body>
     <main class="shell">
@@ -63,6 +63,111 @@
         </div>
       </section>
 
+      <section class="panel global-panel">
+        <div class="section-heading compact-heading">
+          <div>
+            <p class="section-kicker">GLOBAL GENERATION</p>
+            <h2>Generation Controls</h2>
+          </div>
+        </div>
+        <div class="global-controls">
+          <label class="switch-card">
+            <input id="no-drums" type="checkbox" />
+            <span>
+              <b>No Drums</b>
+              <small>モデルへドラムなしを要求</small>
+            </span>
+          </label>
+          <div class="future-control">
+            Temperature / Top-Kなどの全体設定をここへ追加予定
+          </div>
+        </div>
+      </section>
+
+      <section class="panel modulation-panel">
+        <div class="section-heading compact-heading">
+          <div>
+            <p class="section-kicker">PROMPT MODULATION</p>
+            <h2>LFO / MIDI CC</h2>
+          </div>
+          <span class="modulation-note">同一対象では最後の入力を優先</span>
+        </div>
+
+        <div class="modulation-grid">
+          <article class="modulation-source">
+            <div class="source-heading">
+              <label class="check-control">
+                <input id="lfo-enable" type="checkbox" />
+                <span>LFO</span>
+              </label>
+              <strong id="lfo-current">—</strong>
+            </div>
+            <div class="modulation-row two-columns">
+              <label>
+                <span>Target prompt</span>
+                <select id="lfo-target"></select>
+              </label>
+              <label>
+                <span>Waveform</span>
+                <select id="lfo-waveform">
+                  <option value="sine">Sine</option>
+                  <option value="triangle">Triangle</option>
+                  <option value="square">Square</option>
+                  <option value="saw">Saw</option>
+                </select>
+              </label>
+            </div>
+            <label class="range-control">
+              <span>Rate <output id="lfo-rate-value">0.25 Hz</output></span>
+              <input id="lfo-rate" type="range" min="0.05" max="5" step="0.05" value="0.25" />
+            </label>
+            <div class="modulation-row two-columns">
+              <label class="range-control">
+                <span>Min <output id="lfo-min-value">0%</output></span>
+                <input id="lfo-min" type="range" min="0" max="1" step="0.01" value="0" />
+              </label>
+              <label class="range-control">
+                <span>Max <output id="lfo-max-value">100%</output></span>
+                <input id="lfo-max" type="range" min="0" max="1" step="0.01" value="1" />
+              </label>
+            </div>
+          </article>
+
+          <article class="modulation-source">
+            <div class="source-heading">
+              <label class="check-control">
+                <input id="cc-enable" type="checkbox" />
+                <span>MIDI CC</span>
+              </label>
+              <strong id="cc-current">—</strong>
+            </div>
+            <div class="modulation-row two-columns">
+              <label>
+                <span>Target prompt</span>
+                <select id="cc-target"></select>
+              </label>
+              <label>
+                <span>Controller</span>
+                <div class="cc-number-row">
+                  <input id="cc-number" type="number" min="0" max="119" value="1" />
+                  <button id="cc-learn" class="mini-button">Learn</button>
+                </div>
+              </label>
+            </div>
+            <label class="check-control cc-invert">
+              <input id="cc-invert" type="checkbox" />
+              <span>CC値を反転</span>
+            </label>
+            <div class="cc-meter" aria-hidden="true">
+              <span id="cc-meter-fill"></span>
+            </div>
+            <p id="cc-hint" class="hint">
+              Web MIDIで選択中のデバイスからCC 1を待機しています。
+            </p>
+          </article>
+        </div>
+      </section>
+
       <section class="panel midi-panel">
         <div class="section-heading midi-heading">
           <div>
@@ -94,10 +199,6 @@
           <label class="check-control">
             <input id="midi-solo" type="checkbox" />
             <span>Solo</span>
-          </label>
-          <label class="check-control">
-            <input id="no-drums" type="checkbox" />
-            <span>No Drums</span>
           </label>
           <div class="octave-control">
             <button id="octave-down" class="mini-button">−</button>
@@ -229,6 +330,6 @@
         </dl>
       </section>
     </main>
-    <script type="module" src="/static/app.js?v=6"></script>
+    <script type="module" src="/static/app.js?v=7"></script>
   </body>
 </html>

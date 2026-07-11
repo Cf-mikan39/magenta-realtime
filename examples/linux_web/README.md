@@ -31,6 +31,7 @@ terminal and create an SSH tunnel:
 ssh -N -L 8000:127.0.0.1:8000 USER@GPU_SERVER
 ```
 
+
 Then open <http://127.0.0.1:8000> in Chrome or Edge. Press **Start** and allow
 the browser to start Web Audio. Up to six prompt texts are embedded once and
 cached. Slider changes blend the cached embeddings immediately; text edits are
@@ -67,6 +68,23 @@ starts at C3, K/O/L/P/; continues above it, and Z/X changes octave.
 drum-conditioning token masked (`-1`), allowing the model to decide. On sends
 token `0` every 40 ms frame, encouraging drum-free generation. Switching does
 not reset the recurrent streaming state or re-encode prompts.
+
+## Prompt modulation
+
+The browser provides two lightweight modulation sources. Both reuse the
+existing cached prompt-weight WebSocket message and do not add JAX work:
+
+- **LFO** supports sine, triangle, square, and saw waves from 0.05–5 Hz. Pick a
+  target prompt and a minimum/maximum raw weight. The LFO may be enabled before
+  playback; the current local weights are included in the initial prompt bank.
+- **MIDI CC** maps CC values 0–127 to a selected prompt weight. Enter a
+  controller number from 0–119 or press **Learn** and move a physical control.
+  The mapping can be inverted. It listens to the Web MIDI input already
+  selected in the Note Conditioning panel.
+
+If Hand, LFO, and MIDI CC address the same prompt at the same time, the most
+recent update wins. Use separate target prompts when combining sources for
+predictable modulation.
 
 ## Hand landmark and gesture control
 
