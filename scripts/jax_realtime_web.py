@@ -27,6 +27,7 @@ import logging
 from pathlib import Path
 import time
 
+from magenta_rt.live_compat import APPLE_LIVE_MUSICCOCA_MASKED_TAIL_LEVELS
 from magenta_rt.realtime import StereoRingBuffer
 from magenta_rt.realtime_server import CHANNELS
 from magenta_rt.realtime_server import encode_pcm_f32le
@@ -60,6 +61,15 @@ def make_parser() -> argparse.ArgumentParser:
   parser.add_argument("--cfg-notes", type=float, default=2.4)
   parser.add_argument("--cfg-drums", type=float, default=4.0)
   parser.add_argument(
+      "--apple-live-parity",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help=(
+          "match Apple live conditioning/output: mask the final 6 MusicCoCa "
+          "RVQ levels and keep decoder audio as float32 (default: enabled)"
+      ),
+  )
+  parser.add_argument(
       "--buffer-frames",
       type=int,
       default=3,
@@ -85,7 +95,14 @@ def validate_args(args) -> None:
     raise ValueError("--port must be within [1, 65535]")
 
 
-def create_app(*, mrt, model_name: str, buffer_frames: int, prime_frames: int):
+def create_app(
+    *,
+    mrt,
+    model_name: str,
+    buffer_frames: int,
+    prime_frames: int,
+    apple_live_parity: bool = False,
+):
   """Create a FastAPI app around an already compiled MRT2 system."""
   from fastapi import FastAPI  # pylint: disable=import-outside-toplevel
   from fastapi import WebSocket  # pylint: disable=import-outside-toplevel
@@ -120,6 +137,14 @@ def create_app(*, mrt, model_name: str, buffer_frames: int, prime_frames: int):
         "channels": CHANNELS,
         "frame_samples": FRAME_SAMPLES,
         "server_buffer_frames": buffer_frames,
+        "apple_live_parity": apple_live_parity,
+        "musiccoca_masked_tail_levels": (
+            APPLE_LIVE_MUSICCOCA_MASKED_TAIL_LEVELS
+            if apple_live_parity
+            else 0
+        ),
+        "decoder_output": "float32" if apple_live_parity else "int16",
+        "classifier_free_guidance_branches": 2 if apple_live_parity else 0,
     }
 
   @app.websocket("/ws/audio")
@@ -143,6 +168,7 @@ def create_app(*, mrt, model_name: str, buffer_frames: int, prime_frames: int):
           model_name=model_name,
           buffer_frames=buffer_frames,
           prime_frames=prime_frames,
+          apple_live_parity=apple_live_parity,
           disconnect_type=WebSocketDisconnect,
       )
 
@@ -156,6 +182,7 @@ async def _run_stream(
     model_name: str,
     buffer_frames: int,
     prime_frames: int,
+    apple_live_parity: bool,
     disconnect_type,
 ) -> None:
   ring_buffer = None
@@ -180,6 +207,16 @@ async def _run_stream(
             "server_buffer_frames": buffer_frames,
             "server_prime_frames": prime_frames,
             "max_prompts": MAX_PROMPTS,
+            "apple_live_parity": apple_live_parity,
+            "musiccoca_masked_tail_levels": (
+                APPLE_LIVE_MUSICCOCA_MASKED_TAIL_LEVELS
+                if apple_live_parity
+                else 0
+            ),
+            "decoder_output": "float32" if apple_live_parity else "int16",
+            "classifier_free_guidance_branches": (
+                2 if apple_live_parity else 0
+            ),
         }
     )
     start_message = await asyncio.wait_for(
@@ -549,6 +586,11 @@ def main() -> None:
 
   logging.basicConfig(level=logging.INFO, force=True)
   LOGGER.info("Loading %s and compiling the streaming step", args.model)
+  masked_tail_levels = (
+      APPLE_LIVE_MUSICCOCA_MASKED_TAIL_LEVELS
+      if args.apple_live_parity
+      else 0
+  )
   mrt = MagentaRT2Jax(
       size=args.model,
       checkpoint=args.checkpoint,
@@ -557,12 +599,25 @@ def main() -> None:
       cfg_musiccoca=args.cfg_musiccoca,
       cfg_notes=args.cfg_notes,
       cfg_drums=args.cfg_drums,
+      musiccoca_masked_tail_levels=masked_tail_levels,
+      int16_outputs=not args.apple_live_parity,
+      num_cfgs=2 if args.apple_live_parity else 0,
+  )
+  LOGGER.info(
+      "Apple live parity: %s | MusicCoCa masked tail=%d/12 | "
+      "CFG branches=%d (batch=%dx) | decoder=%s",
+      "enabled" if args.apple_live_parity else "disabled",
+      masked_tail_levels,
+      2 if args.apple_live_parity else 0,
+      3 if args.apple_live_parity else 1,
+      "float32" if args.apple_live_parity else "legacy int16",
   )
   app = create_app(
       mrt=mrt,
       model_name=args.model,
       buffer_frames=args.buffer_frames,
       prime_frames=args.prime_frames,
+      apple_live_parity=args.apple_live_parity,
   )
   LOGGER.info(
       "Open http://%s:%d after creating an SSH tunnel",

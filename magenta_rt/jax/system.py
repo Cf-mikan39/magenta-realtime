@@ -30,6 +30,7 @@ from . import depthformer
 from . import model as model_configs
 from . import spectrostream
 from .. import audio
+from ..live_compat import mask_musiccoca_tail
 from .. import musiccoca
 from .. import paths
 
@@ -133,7 +134,7 @@ class MagentaRT2Sampler(sl.SerialCombinatorMixin, sl.Emitting):
     )
     output_dtype = self.soundstream.config.compute_dtype
 
-    self.layers = [
+    layers = [
         self.depthformer.get_sampler_sequence_layer(),
         sl.Lambda.Config(
             functools.partial(
@@ -145,12 +146,18 @@ class MagentaRT2Sampler(sl.SerialCombinatorMixin, sl.Emitting):
         ).make(),
         self.soundstream.quantizer.codes_to_embeddings_layer,
         self.soundstream.embeddings_to_waveform_layer,
-        sl.Lambda.Config(
-            _float_samples_to_int16,
-            mask_required=False,
-            expected_input_spec=sl.ShapeDType(output_channels, output_dtype),
-        ).make(),
     ]
+    if self.cfg.int16_outputs:
+      layers.append(
+          sl.Lambda.Config(
+              _float_samples_to_int16,
+              mask_required=False,
+              expected_input_spec=sl.ShapeDType(
+                  output_channels, output_dtype
+              ),
+          ).make()
+      )
+    self.layers = layers
 
 
 NotesArray = list[int] | np.ndarray
@@ -194,6 +201,9 @@ class MagentaRT2System:
       cfg_musiccoca: float = 3.0,
       cfg_notes: float = 1.0,
       cfg_drums: float = 1.0,
+      musiccoca_masked_tail_levels: int = 0,
+      int16_outputs: bool = True,
+      num_cfgs: int = 0,
   ):
     """Initialise the system: build model, load weights, JIT-compile.
 
@@ -207,10 +217,34 @@ class MagentaRT2System:
       cfg_musiccoca: Classifier-free guidance scale for MusicCoCa.
       cfg_notes: Classifier-free guidance scale for notes.
       cfg_drums: Classifier-free guidance scale for drums.
+      musiccoca_masked_tail_levels: Number of fine MusicCoCa RVQ levels to
+          replace with mask tokens before generation. The native Apple live
+          app uses 6; zero preserves the original JAX/offline behavior.
+      int16_outputs: If true, apply the legacy 0.5 gain and int16 conversion
+          inside the compiled sampler. If false, return decoder float samples.
+      num_cfgs: Number of classifier-free-guidance branches: 0 disables CFG,
+          1 guides MusicCoCa, and 2 guides MusicCoCa plus notes. The native
+          Apple live export uses 2; zero preserves the original JAX path.
     """
     self._model = model_configs.get_model_class(size)()
     self._size = size
     self._style_model = style_model or musiccoca.MusicCoCa()
+    self._num_musiccoca_tokens = (
+        self._model.input_configs[0].rvq_truncation_level
+    )
+    # Validate without needing a real token sequence yet.
+    mask_musiccoca_tail(
+        [0] * self._num_musiccoca_tokens, musiccoca_masked_tail_levels
+    )
+    if not isinstance(int16_outputs, bool):
+      raise TypeError('int16_outputs must be a boolean')
+    if isinstance(num_cfgs, bool) or not isinstance(num_cfgs, int):
+      raise TypeError('num_cfgs must be an integer')
+    if not 0 <= num_cfgs <= 2:
+      raise ValueError('num_cfgs must be 0, 1, or 2')
+    self.musiccoca_masked_tail_levels = musiccoca_masked_tail_levels
+    self.int16_outputs = int16_outputs
+    self.num_cfgs = num_cfgs
 
     depthformer_config = self._model.depthformer_config()
     rvq_truncation = self._model.spectrostream.rvq_truncation_level
@@ -222,6 +256,7 @@ class MagentaRT2System:
     self._sampler = MagentaRT2Sampler.Config(
         depthformer=depthformer_config,
         spectrostream=spectrostream_config,
+        int16_outputs=int16_outputs,
     ).make()
 
     # --- Load checkpoint ---
@@ -246,7 +281,6 @@ class MagentaRT2System:
     self.cfg_drums = cfg_drums
 
     # --- Derived constants ---
-    self._num_musiccoca_tokens = self._model.input_configs[0].rvq_truncation_level
     self._num_notes = self._model.input_configs[1].rvq_truncation_level
     self._drum_tokens = self._model.input_configs[2].rvq_truncation_level
     self._cfg_tokens = sum(
@@ -306,10 +340,11 @@ class MagentaRT2System:
     dummy_notes = [-1] * self._num_notes
     dummy_drums = [-1] * self._drum_tokens
     dummy_cfg = [-1] * self._cfg_tokens
-    block, constants = self._build_conditioning(dummy_style, dummy_notes, dummy_drums, dummy_cfg)
+    block, constants = self._build_conditioning(
+        dummy_style, dummy_notes, dummy_drums, dummy_cfg
+    )
 
-    init_constants = {}
-    state = self._jit_init_state(self._params, init_constants)
+    state = self._jit_init_state(self._params, constants)
     self._jit_streaming_step = _streaming_step.lower(
         self._params, block, constants, state
     ).compile()
@@ -343,6 +378,8 @@ class MagentaRT2System:
       cfgs: list[int] | None = None,
       temperature: float | None = None,
       top_k: int | None = None,
+      cfg_musiccoca: float | None = None,
+      cfg_notes: float | None = None,
   ) -> tuple[sl.Sequence, dict]:
     """Build the conditioning block and constants dict for streaming.
 
@@ -381,7 +418,10 @@ class MagentaRT2System:
     offset = NUM_RESERVED_TOKENS + 1  # +1 for dropout token
 
     # Positive conditioning.
-    cond = np.array(style_tokens + notes_tokens + drums_tokens + cfgs_tokens, dtype=np.int32) + offset
+    cond = np.array(
+        style_tokens + notes_tokens + drums_tokens + cfgs_tokens,
+        dtype=np.int32,
+    ) + offset
     block = sl.Sequence.from_values(cond.reshape(1, 1, -1))
 
     temperature = self.temperature if temperature is None else temperature
@@ -390,6 +430,41 @@ class MagentaRT2System:
         'temperature': jnp.array([temperature]),
         'top_k': jnp.array([top_k], dtype=jnp.int32),
     }
+    cfg_musiccoca = (
+        self.cfg_musiccoca if cfg_musiccoca is None else cfg_musiccoca
+    )
+    cfg_notes = self.cfg_notes if cfg_notes is None else cfg_notes
+    masked_style = [-1] * self._num_musiccoca_tokens
+    masked_notes = [-1] * self._num_notes
+
+    if self.num_cfgs >= 1:
+      negative = np.array(
+          masked_style + notes_tokens + drums_tokens + cfgs_tokens,
+          dtype=np.int32,
+      ) + offset
+      constants.update(
+          {
+              'classifier_free_guidance_scale_musiccoca': jnp.array(
+                  [cfg_musiccoca]
+              ),
+              'classifier_free_guidance_negative_musiccoca': (
+                  sl.Sequence.from_values(negative.reshape(1, 1, -1))
+              ),
+          }
+      )
+    if self.num_cfgs >= 2:
+      negative = np.array(
+          style_tokens + masked_notes + drums_tokens + cfgs_tokens,
+          dtype=np.int32,
+      ) + offset
+      constants.update(
+          {
+              'classifier_free_guidance_scale_notes': jnp.array([cfg_notes]),
+              'classifier_free_guidance_negative_notes': (
+                  sl.Sequence.from_values(negative.reshape(1, 1, -1))
+              ),
+          }
+      )
     return block, constants
 
   def generate(
@@ -453,6 +528,9 @@ class MagentaRT2System:
     if len(style_tokens) < self._num_musiccoca_tokens:
       style_tokens = style_tokens + [-1] * (self._num_musiccoca_tokens - len(style_tokens))
     style_tokens = style_tokens[:self._num_musiccoca_tokens]
+    style_tokens = mask_musiccoca_tail(
+        style_tokens, self.musiccoca_masked_tail_levels
+    )
 
     # --- Resolve CFG scales and discretize to conditioning tokens ---
     cfg_musiccoca = self.cfg_musiccoca if cfg_musiccoca is None else cfg_musiccoca
@@ -466,13 +544,19 @@ class MagentaRT2System:
 
     # --- Build conditioning ---
     block, constants = self._build_conditioning(
-        style_tokens, notes, drums, cfgs, temperature, top_k
+        style_tokens,
+        notes,
+        drums,
+        cfgs,
+        temperature,
+        top_k,
+        cfg_musiccoca,
+        cfg_notes,
     )
 
     # --- Init state if needed ---
     if state is None:
-      init_constants = {}
-      state = self._jit_init_state(self._params, init_constants)
+      state = self._jit_init_state(self._params, constants)
 
     # --- Streaming generation ---
     results = []
@@ -485,14 +569,18 @@ class MagentaRT2System:
 
     # --- Assemble audio ---
     samples = sl.Sequence.concatenate_sequences(results).values[0]
-    samples = jax.device_get(samples).astype(np.int16)
+    samples = jax.device_get(samples)
     elapsed = time.time() - t0
     ms_per_step = (elapsed / frames) * 1000
     logger.debug(
         'Generated %d frames in %.2fs (%.1f ms/step, %.1f steps/s)',
         frames, elapsed, ms_per_step, frames / elapsed,
     )
-    # samples shape: [T*1920, 2] (interleaved stereo int16)
-    waveform = audio.Waveform(samples.astype(np.float32) / 32768.0, sample_rate=self._sample_rate)
+    # samples shape: [T*1920, 2] (interleaved stereo).
+    if self.int16_outputs:
+      float_samples = samples.astype(np.int16).astype(np.float32) / 32768.0
+    else:
+      float_samples = np.asarray(samples, dtype=np.float32)
+    waveform = audio.Waveform(float_samples, sample_rate=self._sample_rate)
 
     return waveform, state

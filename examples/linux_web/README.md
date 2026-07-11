@@ -14,17 +14,21 @@ uv pip install "fastapi>=0.115" "uvicorn[standard]>=0.34"
 python scripts/jax_realtime_web.py --model mrt2_small
 ```
 
+The WebSocket server enables Apple live parity mode by default. It uses the
+same live-app sampling defaults, masks the final 6 of 12 MusicCoCa RVQ
+conditioning levels, runs the same two classifier-free-guidance branches
+(MusicCoCa and notes), and streams the decoder's float32 output without the
+legacy JAX int16 conversion. For an A/B comparison with the previous Linux
+path, start it with `--no-apple-live-parity` instead. The two CFG branches
+increase GPU work, so re-check the 40 ms frame deadline after enabling this
+mode. Sampling remains stochastic, so Apple/MLX and Linux/JAX do not produce
+sample-identical audio.
+
 Keep the server bound to `127.0.0.1`. From the local computer, open a second
 terminal and create an SSH tunnel:
 
 ```sh
 ssh -N -L 8000:127.0.0.1:8000 USER@GPU_SERVER
-```
-
-For the current Rikyu setup, use the same SSH alias as the normal login:
-
-```sh
-ssh -N -L 8000:127.0.0.1:8000 ogata.kai.r5@out-rikyu
 ```
 
 Then open <http://127.0.0.1:8000> in Chrome or Edge. Press **Start** and allow
