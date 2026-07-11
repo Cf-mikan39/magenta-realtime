@@ -323,6 +323,45 @@ class DrumConditioning:
 
 
 @dataclass(frozen=True)
+class SamplingSnapshot:
+  """Current stochastic sampling controls."""
+
+  temperature: float
+  top_k: int
+  revision: int
+
+
+class SamplingConditioning:
+  """Atomically expose live Temperature and Top-K values to JAX."""
+
+  def __init__(self, *, temperature: float = 1.1, top_k: int = 50):
+    self._temperature = _validate_temperature(temperature)
+    self._top_k = _validate_top_k(top_k)
+    self._revision = 0
+    self._lock = threading.Lock()
+
+  def configure(self, *, temperature: object, top_k: object) -> SamplingSnapshot:
+    temperature = _validate_temperature(temperature)
+    top_k = _validate_top_k(top_k)
+    with self._lock:
+      self._temperature = temperature
+      self._top_k = top_k
+      self._revision += 1
+      return self._snapshot_locked()
+
+  def snapshot(self) -> SamplingSnapshot:
+    with self._lock:
+      return self._snapshot_locked()
+
+  def _snapshot_locked(self) -> SamplingSnapshot:
+    return SamplingSnapshot(
+        temperature=self._temperature,
+        top_k=self._top_k,
+        revision=self._revision,
+    )
+
+
+@dataclass(frozen=True)
 class ProducerStats:
   """A consistent snapshot of inference-thread timing counters."""
 
@@ -345,6 +384,7 @@ class JaxRealtimeProducer(threading.Thread):
       ring_buffer: StereoRingBuffer,
       midi: MidiConditioning | None = None,
       drums: DrumConditioning | None = None,
+      sampling: SamplingConditioning | None = None,
       logger: logging.Logger | None = None,
   ):
     super().__init__(name="mrt2-jax-web-producer", daemon=True)
@@ -353,6 +393,7 @@ class JaxRealtimeProducer(threading.Thread):
     self._ring_buffer = ring_buffer
     self._midi = midi
     self._drums = drums
+    self._sampling = sampling
     self._logger = logger or logging.getLogger(__name__)
     self._stop_event = threading.Event()
     self._stats_lock = threading.Lock()
@@ -404,6 +445,10 @@ class JaxRealtimeProducer(threading.Thread):
           drums = self._drums.frame_tokens()
           if drums is not None:
             generate_kwargs["drums"] = drums
+        if self._sampling is not None:
+          sampling = self._sampling.snapshot()
+          generate_kwargs["temperature"] = sampling.temperature
+          generate_kwargs["top_k"] = sampling.top_k
         waveform, state = self._mrt.generate(**generate_kwargs)
         generation_ms = (time.perf_counter() - step_start) * 1000.0
         samples = validate_audio_frame(waveform)
@@ -428,6 +473,23 @@ class JaxRealtimeProducer(threading.Thread):
       self._logger.exception("JAX real-time producer failed")
     finally:
       self._ring_buffer.close()
+
+
+def _validate_temperature(value: object) -> float:
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    raise ValueError("Temperature must be a number")
+  result = float(value)
+  if not math.isfinite(result) or not 0.0 <= result <= 3.0:
+    raise ValueError("Temperature must be within [0.0, 3.0]")
+  return result
+
+
+def _validate_top_k(value: object) -> int:
+  if isinstance(value, bool) or not isinstance(value, int):
+    raise ValueError("Top-K must be an integer")
+  if not 1 <= value <= 1024:
+    raise ValueError("Top-K must be within [1, 1024]")
+  return value
 
 
 def validate_prompt(value: object, *, max_length: int = 500) -> str:

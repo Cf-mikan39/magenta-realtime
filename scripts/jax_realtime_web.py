@@ -42,6 +42,7 @@ from magenta_rt.realtime_server import PromptDefinition
 from magenta_rt.realtime_server import PromptMixer
 from magenta_rt.realtime_server import prompt_definitions_to_json
 from magenta_rt.realtime_server import SAMPLE_RATE
+from magenta_rt.realtime_server import SamplingConditioning
 from magenta_rt.realtime_server import validate_prompt
 from magenta_rt.realtime_server import validate_prompt_definitions
 
@@ -188,6 +189,10 @@ async def _run_stream(
 ) -> None:
   ring_buffer = None
   producer = None
+  sampling = SamplingConditioning(
+      temperature=getattr(mrt, "temperature", 1.1),
+      top_k=getattr(mrt, "top_k", 50),
+  )
   send_lock = asyncio.Lock()
 
   async def send_json(message: dict) -> None:
@@ -198,7 +203,7 @@ async def _run_stream(
     await send_json(
         {
             "type": "hello",
-            "protocol_version": 3,
+            "protocol_version": 4,
             "model": model_name,
             "sample_rate": SAMPLE_RATE,
             "channels": CHANNELS,
@@ -208,6 +213,10 @@ async def _run_stream(
             "server_buffer_frames": buffer_frames,
             "server_prime_frames": prime_frames,
             "max_prompts": MAX_PROMPTS,
+            "sampling_ranges": {
+                "temperature": {"min": 0.0, "max": 3.0},
+                "top_k": {"min": 1, "max": 1024},
+            },
             "apple_live_parity": apple_live_parity,
             "musiccoca_masked_tail_levels": (
                 APPLE_LIVE_MUSICCOCA_MASKED_TAIL_LEVELS
@@ -226,6 +235,14 @@ async def _run_stream(
     if start_message.get("type") != "start":
       raise ValueError("the first client message must have type 'start'")
     initial_definitions = _definitions_from_message(start_message)
+    initial_sampling = start_message.get("sampling")
+    if initial_sampling is not None:
+      if not isinstance(initial_sampling, dict):
+        raise ValueError("sampling must be an object")
+      sampling.configure(
+          temperature=initial_sampling.get("temperature"),
+          top_k=initial_sampling.get("top_k"),
+      )
 
     await send_json(
         {
@@ -252,6 +269,7 @@ async def _run_stream(
         ring_buffer=ring_buffer,
         midi=midi,
         drums=drums,
+        sampling=sampling,
         logger=LOGGER,
     )
     producer.start()
@@ -278,6 +296,10 @@ async def _run_stream(
                 "unmask_width": 4,
             },
             "drums": {"no_drums": False},
+            "sampling": {
+                "temperature": sampling.snapshot().temperature,
+                "top_k": sampling.snapshot().top_k,
+            },
         }
     )
     LOGGER.info(
@@ -295,6 +317,7 @@ async def _run_stream(
             producer=producer,
             midi=midi,
             drums=drums,
+            sampling=sampling,
         ),
         name="mrt2-websocket-audio-sender",
     )
@@ -307,6 +330,7 @@ async def _run_stream(
             embedding_cache=embedding_cache,
             midi=midi,
             drums=drums,
+            sampling=sampling,
         ),
         name="mrt2-websocket-control-receiver",
     )
@@ -342,7 +366,8 @@ async def _run_stream(
 
 
 async def _send_audio(
-    *, websocket, send_lock, send_json, ring_buffer, producer, midi, drums
+    *, websocket, send_lock, send_json, ring_buffer, producer, midi, drums,
+    sampling
 ) -> None:
   sequence = 0
   underrun_frames = 0
@@ -386,6 +411,7 @@ async def _send_audio(
       stats = producer.stats()
       midi_stats = midi.snapshot()
       drum_stats = drums.snapshot()
+      sampling_stats = sampling.snapshot()
       await send_json(
           {
               "type": "metrics",
@@ -407,6 +433,9 @@ async def _send_audio(
               "midi_revision": midi_stats.revision,
               "no_drums": drum_stats.no_drums,
               "drum_revision": drum_stats.revision,
+              "temperature": sampling_stats.temperature,
+              "top_k": sampling_stats.top_k,
+              "sampling_revision": sampling_stats.revision,
           }
       )
 
@@ -453,7 +482,8 @@ async def _encode_definitions(
 
 
 async def _receive_controls(
-    *, websocket, send_json, mrt, prompt, embedding_cache, midi, drums
+    *, websocket, send_json, mrt, prompt, embedding_cache, midi, drums,
+    sampling
 ) -> None:
   while True:
     message = await websocket.receive_json()
@@ -503,6 +533,32 @@ async def _receive_controls(
       LOGGER.info(
           "No Drums %s without resetting streaming state",
           "enabled" if drum_snapshot.no_drums else "disabled",
+      )
+      continue
+
+    if message_type == "sampling_config":
+      try:
+        sampling_snapshot = sampling.configure(
+            temperature=message.get("temperature"),
+            top_k=message.get("top_k"),
+        )
+      except ValueError as exc:
+        await send_json(
+            {"type": "control_error", "message": str(exc)}
+        )
+        continue
+      await send_json(
+          {
+              "type": "sampling_config_applied",
+              "temperature": sampling_snapshot.temperature,
+              "top_k": sampling_snapshot.top_k,
+              "sampling_revision": sampling_snapshot.revision,
+          }
+      )
+      LOGGER.debug(
+          "Sampling updated without resetting state: temperature=%.2f, top_k=%d",
+          sampling_snapshot.temperature,
+          sampling_snapshot.top_k,
       )
       continue
 

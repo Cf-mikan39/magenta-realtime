@@ -2,17 +2,22 @@ import {
   canonicalHandedness,
   HandPromptController,
   hybridPromptWeights,
-} from './hand-control.js?v=8';
+} from './hand-control.js?v=9';
 import {
   lfoValue,
   mapModulationRange,
   midiCcValue,
-} from './modulation.js?v=8';
+} from './modulation.js?v=9';
 
 const COLORS = ['#9b8cff', '#4ed6b2', '#ffb95e', '#ff7891', '#64b5ff', '#d98cff'];
 const MAX_PROMPTS = 6;
 const WEIGHT_SEND_INTERVAL_MS = 40;
 const MODULATION_INTERVAL_MS = 40;
+const SAMPLING_SEND_INTERVAL_MS = 40;
+const TEMPERATURE_MIN = 0;
+const TEMPERATURE_MAX = 3;
+const TOP_K_MIN = 1;
+const TOP_K_MAX = 1024;
 const GESTURE_CONFIRM_FRAMES = 2;
 const GESTURE_HOLD_MS = 320;
 const GESTURES = [
@@ -55,6 +60,10 @@ const elements = {
   autoStrum: document.querySelector('#auto-strum'),
   midiSolo: document.querySelector('#midi-solo'),
   noDrums: document.querySelector('#no-drums'),
+  temperature: document.querySelector('#temperature'),
+  temperatureValue: document.querySelector('#temperature-value'),
+  topK: document.querySelector('#top-k'),
+  topKValue: document.querySelector('#top-k-value'),
   lfoEnable: document.querySelector('#lfo-enable'),
   lfoTarget: document.querySelector('#lfo-target'),
   lfoWaveform: document.querySelector('#lfo-waveform'),
@@ -121,6 +130,7 @@ let browserUnderruns = 0;
 let requestId = 0;
 let stopping = false;
 let weightTimer = null;
+let samplingTimer = null;
 let surfaceDrag = null;
 let midiAccess = null;
 let selectedMidiInput = null;
@@ -427,6 +437,60 @@ function applyModulatedWeight(promptId, value) {
   scheduleWeightUpdate();
 }
 
+function samplingPayload() {
+  return {
+    temperature: Number(elements.temperature.value),
+    top_k: Math.round(Number(elements.topK.value)),
+  };
+}
+
+function syncSamplingControls() {
+  const temperature = Math.max(
+    TEMPERATURE_MIN,
+    Math.min(TEMPERATURE_MAX, Number(elements.temperature.value) || 0),
+  );
+  const topK = Math.max(
+    TOP_K_MIN,
+    Math.min(TOP_K_MAX, Math.round(Number(elements.topK.value) || TOP_K_MIN)),
+  );
+  elements.temperature.value = String(temperature);
+  elements.topK.value = String(topK);
+  elements.temperatureValue.textContent = temperature.toFixed(2);
+  elements.topKValue.textContent = String(topK);
+}
+
+function scheduleSamplingUpdate() {
+  syncSamplingControls();
+  if (!isRunning() || samplingTimer !== null) return;
+  samplingTimer = window.setTimeout(() => {
+    samplingTimer = null;
+    sendSamplingConfig();
+  }, SAMPLING_SEND_INTERVAL_MS);
+}
+
+function samplingUnitValue(parameter) {
+  if (parameter === 'temperature') {
+    return (Number(elements.temperature.value) - TEMPERATURE_MIN)
+      / (TEMPERATURE_MAX - TEMPERATURE_MIN);
+  }
+  return (Number(elements.topK.value) - TOP_K_MIN) / (TOP_K_MAX - TOP_K_MIN);
+}
+
+function applySamplingUnit(parameter, unitValue) {
+  const unit = Math.max(0, Math.min(1, unitValue));
+  if (parameter === 'temperature') {
+    const value = TEMPERATURE_MIN + unit * (TEMPERATURE_MAX - TEMPERATURE_MIN);
+    elements.temperature.value = String(Math.round(value * 20) / 20);
+  } else if (parameter === 'top_k') {
+    elements.topK.value = String(Math.round(
+      TOP_K_MIN + unit * (TOP_K_MAX - TOP_K_MIN),
+    ));
+  } else {
+    return;
+  }
+  scheduleSamplingUpdate();
+}
+
 function syncLfoControls(changed = null) {
   let minValue = Number(elements.lfoMin.value);
   let maxValue = Number(elements.lfoMax.value);
@@ -517,12 +581,12 @@ function handleMidiCc(controller, rawValue) {
 }
 
 function renderHandPromptOptions() {
-  const previousId = Number(elements.handPrompt.value);
-  populatePromptSelect(elements.handPrompt, previousId, 0);
+  const previousTarget = elements.handPrompt.value;
+  populateHandTargetSelect(elements.handPrompt, previousTarget, 0);
   GESTURES.forEach((gesture, index) => {
     const select = gestureSelects[gesture.name];
-    const selectedId = select.options.length > 0 ? Number(select.value) : NaN;
-    populatePromptSelect(select, selectedId, index % prompts.length);
+    const selectedTarget = select.value;
+    populateHandTargetSelect(select, selectedTarget, index % prompts.length);
   });
   const lfoTargetId = elements.lfoTarget.options.length > 0
     ? Number(elements.lfoTarget.value)
@@ -544,6 +608,51 @@ function renderHandPromptOptions() {
   if (handActive) captureHandBaseline();
 }
 
+function promptHandTarget(promptId) {
+  return `prompt:${promptId}`;
+}
+
+function parseHandTarget(value) {
+  if (value === 'sampling:temperature') {
+    return { kind: 'sampling', parameter: 'temperature' };
+  }
+  if (value === 'sampling:top_k') {
+    return { kind: 'sampling', parameter: 'top_k' };
+  }
+  const match = /^prompt:(-?\d+)$/.exec(String(value));
+  return match
+    ? { kind: 'prompt', promptId: Number(match[1]) }
+    : null;
+}
+
+function populateHandTargetSelect(select, previousTarget, defaultIndex) {
+  select.replaceChildren();
+  const promptGroup = document.createElement('optgroup');
+  promptGroup.label = 'Prompts';
+  prompts.forEach((prompt, index) => {
+    const option = document.createElement('option');
+    option.value = promptHandTarget(prompt.id);
+    option.textContent = prompt.text.trim() || `Prompt ${index + 1}`;
+    promptGroup.append(option);
+  });
+  const generationGroup = document.createElement('optgroup');
+  generationGroup.label = 'Generation Controls';
+  for (const [value, label] of [
+    ['sampling:temperature', 'Temperature'],
+    ['sampling:top_k', 'Top-K Sampling'],
+  ]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    generationGroup.append(option);
+  }
+  select.append(promptGroup, generationGroup);
+  const available = [...select.options].some((option) => option.value === previousTarget);
+  select.value = available
+    ? previousTarget
+    : promptHandTarget(prompts[Math.min(defaultIndex, prompts.length - 1)].id);
+}
+
 function populatePromptSelect(select, previousId, defaultIndex) {
   select.replaceChildren();
   prompts.forEach((prompt, index) => {
@@ -559,7 +668,8 @@ function populatePromptSelect(select, previousId, defaultIndex) {
 }
 
 function captureHandBaseline() {
-  const targetId = Number(elements.handPrompt.value);
+  const target = parseHandTarget(elements.handPrompt.value);
+  const targetId = target?.kind === 'prompt' ? target.promptId : null;
   const otherPrompts = prompts.filter((prompt) => prompt.id !== targetId);
   const total = otherPrompts.reduce((sum, prompt) => sum + prompt.weight, 0);
   handBaseline = new Map();
@@ -586,17 +696,26 @@ function applyHandFrame({ hands }) {
   const strength = hand?.pinchStrength;
   if (strength === null || !Number.isFinite(strength)) return;
   const value = Math.max(0, Math.min(1, strength));
-  const targetId = Number(elements.handPrompt.value);
-  for (const prompt of prompts) {
-    prompt.weight = prompt.id === targetId
-      ? value
-      : (handBaseline.get(prompt.id) ?? 0) * (1 - value);
+  const target = parseHandTarget(elements.handPrompt.value);
+  if (!target) return;
+  if (target.kind === 'sampling') {
+    applySamplingUnit(target.parameter, value);
+  } else {
+    for (const prompt of prompts) {
+      prompt.weight = prompt.id === target.promptId
+        ? value
+        : (handBaseline.get(prompt.id) ?? 0) * (1 - value);
+    }
+    updateWeightDisplays();
+    scheduleWeightUpdate();
   }
   elements.handStrength.textContent = `${Math.round(value * 100)}%`;
   elements.handMeterFill.style.width = `${value * 100}%`;
-  elements.handStatus.textContent = `${hand.handedness}: Pinch ${Math.round(value * 100)}%`;
-  updateWeightDisplays();
-  scheduleWeightUpdate();
+  const targetLabel = target.kind === 'prompt'
+    ? 'Prompt'
+    : target.parameter === 'temperature' ? 'Temperature' : 'Top-K';
+  elements.handStatus.textContent =
+    `${hand.handedness}: Pinch → ${targetLabel} ${Math.round(value * 100)}%`;
 }
 
 function updateGestureStates(hands, now) {
@@ -649,17 +768,31 @@ function activeGestureHands() {
   return [...gestureStates.entries()].filter(([, state]) => state.active !== null);
 }
 
-function gestureWeightMap(activeHands) {
-  const contributions = new Map();
+function gestureTargetMaps(activeHands) {
+  const promptContributions = new Map();
+  const samplingContributions = new Map();
   for (const [, state] of activeHands) {
     const select = gestureSelects[state.active];
-    const promptId = Number(select.value);
-    contributions.set(
-      promptId,
-      Math.max(contributions.get(promptId) ?? 0, state.confidence),
-    );
+    const target = parseHandTarget(select.value);
+    if (target?.kind === 'prompt') {
+      promptContributions.set(
+        target.promptId,
+        Math.max(promptContributions.get(target.promptId) ?? 0, state.confidence),
+      );
+    } else if (target?.kind === 'sampling') {
+      samplingContributions.set(
+        target.parameter,
+        Math.max(samplingContributions.get(target.parameter) ?? 0, state.confidence),
+      );
+    }
   }
-  return contributions;
+  return { promptContributions, samplingContributions };
+}
+
+function applyGestureSampling(contributions) {
+  for (const [parameter, confidence] of contributions) {
+    applySamplingUnit(parameter, confidence);
+  }
 }
 
 function gestureDescriptions(activeHands) {
@@ -678,18 +811,23 @@ function applyGestureFrame(hands, now = performance.now()) {
     return;
   }
 
-  const contributions = gestureWeightMap(activeHands);
-  const total = [...contributions.values()].reduce((sum, value) => sum + value, 0);
-  if (total <= 0) return;
-  for (const prompt of prompts) {
-    prompt.weight = (contributions.get(prompt.id) ?? 0) / total;
+  const { promptContributions, samplingContributions } = gestureTargetMaps(activeHands);
+  applyGestureSampling(samplingContributions);
+  const total = [...promptContributions.values()].reduce(
+    (sum, value) => sum + value,
+    0,
+  );
+  if (total > 0) {
+    for (const prompt of prompts) {
+      prompt.weight = (promptContributions.get(prompt.id) ?? 0) / total;
+    }
+    updateWeightDisplays();
+    scheduleWeightUpdate();
   }
 
   elements.handStatus.textContent = gestureDescriptions(activeHands).join(' · ');
   elements.handStrength.textContent = `${activeHands.length} hand`;
   elements.handMeterFill.style.width = `${Math.min(100, activeHands.length * 50)}%`;
-  updateWeightDisplays();
-  scheduleWeightUpdate();
 }
 
 function hybridRoleForHand(hand) {
@@ -715,16 +853,35 @@ function applyHybridFrame(hands, now = performance.now()) {
   if (!Number.isFinite(hybridPinchValue)) return;
 
   const activeHands = activeGestureHands();
-  const contributions = gestureWeightMap(activeHands);
-  const targetId = Number(elements.handPrompt.value);
-  const weights = hybridPromptWeights({
-    promptIds: prompts.map((prompt) => prompt.id),
-    pinchTargetId: targetId,
-    pinchValue: hybridPinchValue,
-    baselineWeights: prompts.map((prompt) => handBaseline.get(prompt.id) ?? 0),
-    gestureWeights: prompts.map((prompt) => contributions.get(prompt.id) ?? 0),
-  });
-  prompts.forEach((prompt, index) => { prompt.weight = weights[index]; });
+  const { promptContributions, samplingContributions } = gestureTargetMaps(activeHands);
+  applyGestureSampling(samplingContributions);
+  const pinchTarget = parseHandTarget(elements.handPrompt.value);
+  let promptWeightsChanged = false;
+  if (pinchTarget?.kind === 'sampling') {
+    applySamplingUnit(pinchTarget.parameter, hybridPinchValue);
+    const gestureTotal = [...promptContributions.values()].reduce(
+      (sum, value) => sum + value,
+      0,
+    );
+    if (gestureTotal > 0) {
+      prompts.forEach((prompt) => {
+        prompt.weight = (promptContributions.get(prompt.id) ?? 0) / gestureTotal;
+      });
+      promptWeightsChanged = true;
+    }
+  } else if (pinchTarget?.kind === 'prompt') {
+    const weights = hybridPromptWeights({
+      promptIds: prompts.map((prompt) => prompt.id),
+      pinchTargetId: pinchTarget.promptId,
+      pinchValue: hybridPinchValue,
+      baselineWeights: prompts.map((prompt) => handBaseline.get(prompt.id) ?? 0),
+      gestureWeights: prompts.map(
+        (prompt) => promptContributions.get(prompt.id) ?? 0,
+      ),
+    });
+    prompts.forEach((prompt, index) => { prompt.weight = weights[index]; });
+    promptWeightsChanged = true;
+  }
 
   const descriptions = gestureDescriptions(activeHands);
   descriptions.push(...pinchHands.map((hand) => (
@@ -737,8 +894,10 @@ function applyHybridFrame(hands, now = performance.now()) {
   }
   elements.handStrength.textContent = `${Math.round(hybridPinchValue * 100)}%`;
   elements.handMeterFill.style.width = `${hybridPinchValue * 100}%`;
-  updateWeightDisplays();
-  scheduleWeightUpdate();
+  if (promptWeightsChanged) {
+    updateWeightDisplays();
+    scheduleWeightUpdate();
+  }
 }
 
 function setHandControlMode(mode) {
@@ -753,16 +912,19 @@ function setHandControlMode(mode) {
   elements.handHybridMode.classList.toggle('active', hybridMode);
   elements.handMeterLabel.textContent = gestureMode ? 'Active gestures' : 'Prompt strength';
   const hints = {
-    pinch: '親指と人差し指を閉じると0%、広げると100%。選択したプロンプト以外の比率を保ったまま連続制御します。',
-    gesture: 'ジェスチャーを2フレーム連続で認識すると適用し、短い見失いでは直前の状態を保持します。',
-    hybrid: 'Pinchが選択プロンプトの比率を決め、Gesture Mapが残りをブレンドします。左右の役割は上で入れ替えられます。',
+    pinch: '親指と人差し指を閉じると0%、広げると100%。プロンプト、Temperature、Top-Kから制御対象を選べます。',
+    gesture: 'ジェスチャーを2フレーム連続で認識すると、割り当てたプロンプトまたは生成つまみへ適用します。',
+    hybrid: 'PinchとGesture Mapを左右同時に使い、プロンプトまたは生成つまみを制御します。左右の役割は上で入れ替えられます。',
   };
   elements.handControlHint.textContent = hints[mode];
   gestureStates.clear();
+  const target = parseHandTarget(elements.handPrompt.value);
   hybridPinchValue = hybridMode
-    ? Math.max(0, Math.min(1, prompts.find(
-      (prompt) => prompt.id === Number(elements.handPrompt.value),
-    )?.weight ?? 0))
+    ? target?.kind === 'sampling'
+      ? samplingUnitValue(target.parameter)
+      : Math.max(0, Math.min(1, prompts.find(
+        (prompt) => prompt.id === target?.promptId,
+      )?.weight ?? 0))
     : null;
   elements.handStrength.textContent = '—';
   elements.handMeterFill.style.width = '0%';
@@ -836,6 +998,14 @@ function sendDrumConfig() {
   socket.send(JSON.stringify({
     type: 'drum_config',
     no_drums: elements.noDrums.checked,
+  }));
+}
+
+function sendSamplingConfig() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({
+    type: 'sampling_config',
+    ...samplingPayload(),
   }));
 }
 
@@ -1024,7 +1194,7 @@ async function createAudioPlayer() {
       `AudioContextが48 kHzではありません (${actualSampleRate} Hz)。`,
     );
   }
-  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=8');
+  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=9');
   playerNode = new AudioWorkletNode(audioContext, 'mrt2-pcm-player', {
     numberOfInputs: 0,
     numberOfOutputs: 1,
@@ -1064,13 +1234,17 @@ async function destroyAudioPlayer() {
 function handleControlMessage(message) {
   switch (message.type) {
     case 'hello':
-      if (message.protocol_version < 3) {
+      if (message.protocol_version < 4) {
         throw new Error('サーバーのWebSocketプロトコルが古いバージョンです。');
       }
       elements.model.textContent = message.model;
       elements.audioFormat.textContent =
         `${message.sample_rate / 1_000} kHz · stereo · ${message.pcm_format}`;
-      socket.send(JSON.stringify({ type: 'start', prompts: promptPayload() }));
+      socket.send(JSON.stringify({
+        type: 'start',
+        prompts: promptPayload(),
+        sampling: samplingPayload(),
+      }));
       setStatus(`${prompts.length}個の初期プロンプトを送信しました。`, 'working');
       break;
     case 'status':
@@ -1085,6 +1259,11 @@ function handleControlMessage(message) {
       });
       bankDirty = false;
       setControls(true);
+      if (message.sampling) {
+        elements.temperature.value = String(message.sampling.temperature);
+        elements.topK.value = String(message.sampling.top_k);
+        syncSamplingControls();
+      }
       sendMidiConfig();
       sendDrumConfig();
       for (const pitch of activeMidiNotes) sendMidiNote(pitch, true);
@@ -1124,6 +1303,8 @@ function handleControlMessage(message) {
       break;
     case 'drum_config_applied':
       elements.noDrums.checked = message.no_drums;
+      break;
+    case 'sampling_config_applied':
       break;
     case 'metrics':
       elements.generationMs.textContent =
@@ -1222,6 +1403,10 @@ function stop() {
     clearTimeout(weightTimer);
     weightTimer = null;
   }
+  if (samplingTimer !== null) {
+    clearTimeout(samplingTimer);
+    samplingTimer = null;
+  }
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ type: 'stop' }));
     socket.close(1000, 'user stopped playback');
@@ -1272,6 +1457,8 @@ elements.computerKeyboard.addEventListener('change', () => {
 elements.autoStrum.addEventListener('change', sendMidiConfig);
 elements.midiSolo.addEventListener('change', sendMidiConfig);
 elements.noDrums.addEventListener('change', sendDrumConfig);
+elements.temperature.addEventListener('input', scheduleSamplingUpdate);
+elements.topK.addEventListener('input', scheduleSamplingUpdate);
 elements.lfoEnable.addEventListener('change', () => {
   setLfoEnabled(elements.lfoEnable.checked);
 });
@@ -1296,9 +1483,12 @@ elements.handEnable.addEventListener('click', toggleHandControl);
 elements.handPrompt.addEventListener('change', () => {
   captureHandBaseline();
   if (handControlMode === 'hybrid') {
-    hybridPinchValue = Math.max(0, Math.min(1, prompts.find(
-      (prompt) => prompt.id === Number(elements.handPrompt.value),
-    )?.weight ?? 0));
+    const target = parseHandTarget(elements.handPrompt.value);
+    hybridPinchValue = target?.kind === 'sampling'
+      ? samplingUnitValue(target.parameter)
+      : Math.max(0, Math.min(1, prompts.find(
+        (prompt) => prompt.id === target?.promptId,
+      )?.weight ?? 0));
   }
 });
 elements.handPinchMode.addEventListener('click', () => setHandControlMode('pinch'));
@@ -1341,4 +1531,5 @@ setHandControlMode('pinch');
 setControls(false);
 updateMidiUi();
 syncLfoControls();
+syncSamplingControls();
 updateCcHint();

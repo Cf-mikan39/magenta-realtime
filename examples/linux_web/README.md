@@ -31,6 +31,11 @@ terminal and create an SSH tunnel:
 ssh -N -L 8000:127.0.0.1:8000 USER@GPU_SERVER
 ```
 
+For the current Rikyu setup, use the same SSH alias as the normal login:
+
+```sh
+ssh -N -L 8000:127.0.0.1:8000 ogata.kai.r5@out-rikyu
+```
 
 Then open <http://127.0.0.1:8000> in Chrome or Edge. Press **Start** and allow
 the browser to start Web Audio. Up to six prompt texts are embedded once and
@@ -69,6 +74,19 @@ drum-conditioning token masked (`-1`), allowing the model to decide. On sends
 token `0` every 40 ms frame, encouraging drum-free generation. Switching does
 not reset the recurrent streaming state or re-encode prompts.
 
+## Sampling controls
+
+The Global Generation panel exposes the native MRT2 parameter ranges:
+
+- **Temperature**: 0.0–3.0 in 0.05 steps. Lower values are more stable;
+  higher values introduce more sampling variation.
+- **Top-K Sampling**: 1–1024. This limits the candidate set considered for
+  each sampled token.
+
+The browser sends both values atomically and at most once every 40 ms. The JAX
+step receives arrays with unchanged shape and dtype, so live changes preserve
+the recurrent state and do not require prompt encoding or recompilation.
+
 ## Prompt modulation
 
 The browser provides two lightweight modulation sources. Both reuse the
@@ -91,11 +109,14 @@ predictable modulation.
 The hand controller runs entirely in the local browser and does not upload
 camera frames to the GPU server. It has three modes:
 
-- **Pinch** maps the normalized thumb/index distance to one prompt. A closed
-  pinch is 0% and a wide spread is 100%; **Invert** reverses the mapping.
+- **Pinch** maps the normalized thumb/index distance to one prompt,
+  Temperature, or Top-K. A closed pinch is 0% and a wide spread is 100%;
+  **Invert** reverses the mapping.
 - **Gesture Map** assigns Victory/peace, Open Palm, Fox, and Closed Fist to
-  prompt slots. MediaPipe's canned recognizer handles all but Fox; Fox is
-  classified from finger extension and thumb-contact landmarks.
+  prompt slots or either sampling control. Sampling controls use recognition
+  confidence as their normalized knob position. MediaPipe's canned recognizer
+  handles all but Fox; Fox is classified from finger extension and
+  thumb-contact landmarks.
 - **Hybrid** assigns Pinch, Gesture Map, or Off independently to the anatomical
   right and left hands. It defaults to right-hand Gesture Map plus left-hand
   Pinch. Pinch sets its prompt's share and active gestures blend the remaining

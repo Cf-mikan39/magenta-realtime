@@ -313,7 +313,7 @@ button.listener:active { cursor: grabbing; }
 
 .global-controls {
   display: grid;
-  grid-template-columns: minmax(220px, 0.65fr) minmax(280px, 1.35fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -334,16 +334,23 @@ button.listener:active { cursor: grabbing; }
 .switch-card b { color: #eef0f3; font-size: 13px; }
 .switch-card small { margin-top: 4px; color: #7f8794; font-size: 10px; }
 
-.future-control {
-  display: flex;
+.generation-control {
+  display: grid;
   min-height: 62px;
-  align-items: center;
+  align-content: center;
+  gap: 8px;
   padding: 12px 14px;
-  border: 1px dashed #333946;
+  border: 1px solid #343a46;
   border-radius: 12px;
-  color: #69717e;
+  background: #10131a;
+  color: #cbd0d9;
   font-size: 11px;
 }
+
+.generation-control > span { display: flex; justify-content: space-between; gap: 10px; }
+.generation-control output { color: #78f2be; font-variant-numeric: tabular-nums; }
+.generation-control input { width: 100%; accent-color: #8d7cf5; }
+.generation-control small { color: #7f8794; font-size: 10px; }
 
 .modulation-note { color: #777f8b; font-size: 10px; }
 

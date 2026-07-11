@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MRT2 Linux Real-time</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/style.css?v=8" />
+    <link rel="stylesheet" href="/static/style.css?v=9" />
   </head>
   <body>
     <main class="shell">
@@ -78,9 +78,16 @@
               <small>モデルへドラムなしを要求</small>
             </span>
           </label>
-          <div class="future-control">
-            Temperature / Top-Kなどの全体設定をここへ追加予定
-          </div>
+          <label class="generation-control">
+            <span>Temperature <output id="temperature-value">1.10</output></span>
+            <input id="temperature" type="range" min="0" max="3" step="0.05" value="1.1" />
+            <small>低いほど安定、高いほど変化が大きい</small>
+          </label>
+          <label class="generation-control">
+            <span>Top-K Sampling <output id="top-k-value">50</output></span>
+            <input id="top-k" type="range" min="1" max="1024" step="1" value="50" />
+            <small>次トークンの候補数</small>
+          </label>
         </div>
       </section>
 
@@ -267,7 +274,7 @@
 
             <div id="hand-pinch-controls">
               <div class="hand-device-row">
-                <span class="control-label">制御するプロンプト</span>
+                <span class="control-label">制御対象</span>
                 <select id="hand-prompt" aria-label="hand controlled prompt"></select>
               </div>
               <label class="check-control hand-invert">
@@ -351,6 +358,6 @@
         </dl>
       </section>
     </main>
-    <script type="module" src="/static/app.js?v=8"></script>
+    <script type="module" src="/static/app.js?v=9"></script>
   </body>
 </html>

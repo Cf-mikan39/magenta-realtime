@@ -30,6 +30,7 @@ from magenta_rt.realtime_server import PromptConditioning
 from magenta_rt.realtime_server import PromptDefinition
 from magenta_rt.realtime_server import PromptMixer
 from magenta_rt.realtime_server import SAMPLE_RATE
+from magenta_rt.realtime_server import SamplingConditioning
 from magenta_rt.realtime_server import normalize_prompt_weights
 from magenta_rt.realtime_server import validate_prompt_definitions
 from magenta_rt.realtime_server import validate_prompt
@@ -50,11 +51,18 @@ class _FakeMrt:
     self.states = []
     self.notes = []
     self.drums = []
+    self.temperatures = []
+    self.top_ks = []
 
-  def generate(self, *, style, frames, state, notes=None, drums=None):
+  def generate(
+      self, *, style, frames, state, notes=None, drums=None,
+      temperature=None, top_k=None
+  ):
     self.states.append(state)
     self.notes.append(notes)
     self.drums.append(drums)
+    self.temperatures.append(temperature)
+    self.top_ks.append(top_k)
     next_state = 1 if state is None else state + 1
     return _FakeWaveform(float(style)), next_state
 
@@ -229,6 +237,47 @@ class DrumConditioningTest(unittest.TestCase):
     producer.stop()
     producer.join(timeout=1.0)
     self.assertEqual(mrt.drums[0], [0])
+
+
+class SamplingConditioningTest(unittest.TestCase):
+
+  def test_updates_sampling_values_atomically(self):
+    sampling = SamplingConditioning(temperature=1.1, top_k=50)
+    snapshot = sampling.configure(temperature=2.25, top_k=128)
+    self.assertEqual(snapshot.temperature, 2.25)
+    self.assertEqual(snapshot.top_k, 128)
+    self.assertEqual(snapshot.revision, 1)
+
+  def test_rejects_out_of_range_values(self):
+    sampling = SamplingConditioning()
+    with self.assertRaises(ValueError):
+      sampling.configure(temperature=3.1, top_k=50)
+    with self.assertRaises(ValueError):
+      sampling.configure(temperature=1.1, top_k=0)
+    with self.assertRaises(ValueError):
+      sampling.configure(temperature=1.1, top_k=40.5)
+
+  def test_producer_passes_sampling_without_resetting_state(self):
+    mrt = _FakeMrt()
+    sampling = SamplingConditioning(temperature=0.75, top_k=24)
+    ring = StereoRingBuffer(2 * FRAME_SAMPLES)
+    producer = JaxRealtimeProducer(
+        mrt=mrt,
+        prompt=PromptConditioning("one", 0.5),
+        ring_buffer=ring,
+        sampling=sampling,
+    )
+    producer.start()
+    self.assertTrue(ring.wait_for_available(2 * FRAME_SAMPLES, timeout=1.0))
+    sampling.configure(temperature=1.5, top_k=96)
+    ring.read(2 * FRAME_SAMPLES, zero_pad=False)
+    self.assertTrue(ring.wait_for_available(FRAME_SAMPLES, timeout=1.0))
+    producer.stop()
+    producer.join(timeout=1.0)
+    self.assertEqual(mrt.states[:2], [None, 1])
+    self.assertEqual(mrt.temperatures[0], 0.75)
+    self.assertIn(1.5, mrt.temperatures)
+    self.assertIn(96, mrt.top_ks)
 
 
 class PcmEncodingTest(unittest.TestCase):
