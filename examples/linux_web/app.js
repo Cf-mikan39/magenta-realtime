@@ -1,6 +1,16 @@
+import { HandPromptController } from './hand-control.js?v=5';
+
 const COLORS = ['#9b8cff', '#4ed6b2', '#ffb95e', '#ff7891', '#64b5ff', '#d98cff'];
 const MAX_PROMPTS = 6;
 const WEIGHT_SEND_INTERVAL_MS = 40;
+const GESTURE_CONFIRM_FRAMES = 2;
+const GESTURE_HOLD_MS = 320;
+const GESTURES = [
+  { name: 'victory', label: 'ピース' },
+  { name: 'open_palm', label: '手のひら' },
+  { name: 'fox', label: 'キツネ' },
+  { name: 'closed_fist', label: '握りこぶし' },
+];
 const KEY_TO_SEMITONE = {
   a: 0, w: 1, s: 2, e: 3, d: 4, f: 5, t: 6, g: 7,
   y: 8, h: 9, u: 10, j: 11, k: 12, o: 13, l: 14, p: 15, ';': 16,
@@ -41,6 +51,25 @@ const elements = {
   octaveDown: document.querySelector('#octave-down'),
   octaveUp: document.querySelector('#octave-up'),
   octaveLabel: document.querySelector('#octave-label'),
+  handEnable: document.querySelector('#hand-enable'),
+  handPrompt: document.querySelector('#hand-prompt'),
+  handInvert: document.querySelector('#hand-invert'),
+  handPinchMode: document.querySelector('#hand-pinch-mode'),
+  handGestureMode: document.querySelector('#hand-gesture-mode'),
+  handPinchControls: document.querySelector('#hand-pinch-controls'),
+  handGestureMap: document.querySelector('#hand-gesture-map'),
+  gestureVictory: document.querySelector('#gesture-victory'),
+  gestureOpenPalm: document.querySelector('#gesture-open-palm'),
+  gestureFox: document.querySelector('#gesture-fox'),
+  gestureClosedFist: document.querySelector('#gesture-closed-fist'),
+  handLed: document.querySelector('#hand-led'),
+  handStatus: document.querySelector('#hand-status'),
+  handStrength: document.querySelector('#hand-strength'),
+  handMeterFill: document.querySelector('#hand-meter-fill'),
+  handMeterLabel: document.querySelector('#hand-meter-label'),
+  handControlHint: document.querySelector('#hand-control-hint'),
+  handVideo: document.querySelector('#hand-video'),
+  handCanvas: document.querySelector('#hand-canvas'),
 };
 
 let prompts = [
@@ -67,6 +96,23 @@ let keyboardBaseNote = 48;
 const activeMidiNotes = new Set();
 const heldMidiNotes = new Set();
 const pressedComputerKeys = new Map();
+let handActive = false;
+let handBaseline = new Map();
+let handControlMode = 'pinch';
+const gestureStates = new Map();
+const gestureSelects = {
+  victory: elements.gestureVictory,
+  open_palm: elements.gestureOpenPalm,
+  fox: elements.gestureFox,
+  closed_fist: elements.gestureClosedFist,
+};
+const handController = new HandPromptController({
+  video: elements.handVideo,
+  canvas: elements.handCanvas,
+  getInvert: () => elements.handInvert.checked,
+  onFrame: applyHandFrame,
+  onStatus: updateHandStatus,
+});
 
 function setStatus(message, state = 'working') {
   elements.status.textContent = message;
@@ -148,6 +194,7 @@ function renderPrompts() {
     input.addEventListener('input', () => {
       prompt.text = input.value;
       markBankDirty();
+      renderHandPromptOptions();
       updateSurface();
     });
 
@@ -192,6 +239,7 @@ function renderPrompts() {
 
   elements.promptList.classList.toggle('surface-active', mixMode === 'surface');
   setControls(isRunning());
+  renderHandPromptOptions();
   updateSurface();
 }
 
@@ -327,6 +375,222 @@ function scheduleWeightUpdate() {
     if (!socket || socket.readyState !== WebSocket.OPEN || bankDirty) return;
     socket.send(JSON.stringify({ type: 'set_weights', weights: weightPayload() }));
   }, WEIGHT_SEND_INTERVAL_MS);
+}
+
+function renderHandPromptOptions() {
+  const previousId = Number(elements.handPrompt.value);
+  populatePromptSelect(elements.handPrompt, previousId, 0);
+  GESTURES.forEach((gesture, index) => {
+    const select = gestureSelects[gesture.name];
+    const selectedId = select.options.length > 0 ? Number(select.value) : NaN;
+    populatePromptSelect(select, selectedId, index % prompts.length);
+  });
+  elements.handPrompt.disabled = prompts.length < 2;
+  elements.handEnable.disabled = prompts.length < 2;
+  if (prompts.length < 2 && handActive) {
+    handController.stop();
+    handActive = false;
+    setHandModeLock(false);
+    elements.handEnable.textContent = 'カメラを有効化';
+  }
+  if (handActive) captureHandBaseline();
+}
+
+function populatePromptSelect(select, previousId, defaultIndex) {
+  select.replaceChildren();
+  prompts.forEach((prompt, index) => {
+    const option = document.createElement('option');
+    option.value = String(prompt.id);
+    option.textContent = prompt.text.trim() || `Prompt ${index + 1}`;
+    select.append(option);
+  });
+  const selected = prompts.some((prompt) => prompt.id === previousId)
+    ? previousId
+    : prompts[Math.min(defaultIndex, prompts.length - 1)].id;
+  select.value = String(selected);
+}
+
+function captureHandBaseline() {
+  const targetId = Number(elements.handPrompt.value);
+  const otherPrompts = prompts.filter((prompt) => prompt.id !== targetId);
+  const total = otherPrompts.reduce((sum, prompt) => sum + prompt.weight, 0);
+  handBaseline = new Map();
+  for (const prompt of otherPrompts) {
+    const share = total > 0
+      ? prompt.weight / total
+      : 1 / Math.max(1, otherPrompts.length);
+    handBaseline.set(prompt.id, share);
+  }
+}
+
+function applyHandFrame({ hands }) {
+  elements.handLed.classList.toggle('tracking', hands.length > 0);
+  if (!handActive) return;
+  if (handControlMode === 'gesture') {
+    applyGestureFrame(hands);
+    return;
+  }
+  const hand = hands[0];
+  const strength = hand?.pinchStrength;
+  if (strength === null || !Number.isFinite(strength)) return;
+  const value = Math.max(0, Math.min(1, strength));
+  const targetId = Number(elements.handPrompt.value);
+  for (const prompt of prompts) {
+    prompt.weight = prompt.id === targetId
+      ? value
+      : (handBaseline.get(prompt.id) ?? 0) * (1 - value);
+  }
+  elements.handStrength.textContent = `${Math.round(value * 100)}%`;
+  elements.handMeterFill.style.width = `${value * 100}%`;
+  elements.handStatus.textContent = `${hand.handedness}: Pinch ${Math.round(value * 100)}%`;
+  updateWeightDisplays();
+  scheduleWeightUpdate();
+}
+
+function applyGestureFrame(hands, now = performance.now()) {
+  const seenHands = new Set();
+  for (const hand of hands) {
+    const key = hand.handedness;
+    seenHands.add(key);
+    const state = gestureStates.get(key) ?? {
+      candidate: null,
+      candidateFrames: 0,
+      active: null,
+      confidence: 0,
+      lastRecognizedMs: -Infinity,
+    };
+    const recognized = GESTURES.some(({ name }) => name === hand.gesture)
+      && hand.gestureConfidence >= 0.45;
+    if (recognized) {
+      if (state.candidate === hand.gesture) {
+        state.candidateFrames += 1;
+      } else {
+        state.candidate = hand.gesture;
+        state.candidateFrames = 1;
+      }
+      if (state.candidateFrames >= GESTURE_CONFIRM_FRAMES) {
+        const gestureChanged = state.active !== hand.gesture;
+        state.active = hand.gesture;
+        state.confidence = !gestureChanged && state.confidence > 0
+          ? 0.72 * state.confidence + 0.28 * hand.gestureConfidence
+          : hand.gestureConfidence;
+        state.lastRecognizedMs = now;
+      }
+    } else {
+      state.candidate = null;
+      state.candidateFrames = 0;
+    }
+    gestureStates.set(key, state);
+  }
+
+  for (const [key, state] of gestureStates) {
+    if (!seenHands.has(key) || now - state.lastRecognizedMs > GESTURE_HOLD_MS) {
+      if (now - state.lastRecognizedMs > GESTURE_HOLD_MS) {
+        state.active = null;
+        state.confidence = 0;
+      }
+    }
+  }
+
+  const activeHands = [...gestureStates.entries()]
+    .filter(([, state]) => state.active !== null);
+  if (activeHands.length === 0) {
+    elements.handStrength.textContent = '—';
+    elements.handMeterFill.style.width = '0%';
+    return;
+  }
+
+  const contributions = new Map();
+  for (const [, state] of activeHands) {
+    const select = gestureSelects[state.active];
+    const promptId = Number(select.value);
+    contributions.set(
+      promptId,
+      Math.max(contributions.get(promptId) ?? 0, state.confidence),
+    );
+  }
+  const total = [...contributions.values()].reduce((sum, value) => sum + value, 0);
+  if (total <= 0) return;
+  for (const prompt of prompts) {
+    prompt.weight = (contributions.get(prompt.id) ?? 0) / total;
+  }
+
+  const descriptions = activeHands.map(([hand, state]) => {
+    const label = GESTURES.find(({ name }) => name === state.active)?.label;
+    return `${hand}: ${label} ${Math.round(state.confidence * 100)}%`;
+  });
+  elements.handStatus.textContent = descriptions.join(' · ');
+  elements.handStrength.textContent = `${activeHands.length} hand`;
+  elements.handMeterFill.style.width = `${Math.min(100, activeHands.length * 50)}%`;
+  updateWeightDisplays();
+  scheduleWeightUpdate();
+}
+
+function setHandControlMode(mode) {
+  handControlMode = mode;
+  const gestureMode = mode === 'gesture';
+  elements.handPinchControls.hidden = gestureMode;
+  elements.handGestureMap.hidden = !gestureMode;
+  elements.handPinchMode.classList.toggle('active', !gestureMode);
+  elements.handGestureMode.classList.toggle('active', gestureMode);
+  elements.handMeterLabel.textContent = gestureMode
+    ? 'Active gestures'
+    : 'Prompt strength';
+  elements.handControlHint.textContent = gestureMode
+    ? 'ジェスチャーを2フレーム連続で認識すると適用し、短い見失いでは直前の状態を保持します。'
+    : '親指と人差し指を閉じると0%、広げると100%。選択したプロンプト以外の比率を保ったまま連続制御します。';
+  gestureStates.clear();
+  elements.handStrength.textContent = '—';
+  elements.handMeterFill.style.width = '0%';
+  if (!gestureMode) captureHandBaseline();
+}
+
+function updateHandStatus(state, message) {
+  elements.handStatus.textContent = message;
+  elements.handLed.className = `hand-led ${state}`;
+  if (state === 'error') {
+    handActive = false;
+    setHandModeLock(false);
+    elements.handEnable.disabled = prompts.length < 2;
+    elements.handEnable.textContent = 'カメラを有効化';
+  }
+}
+
+function setHandModeLock(locked) {
+  elements.listMode.disabled = locked;
+  elements.surfaceMode.disabled = locked;
+}
+
+async function toggleHandControl() {
+  if (handActive) {
+    handController.stop();
+    handActive = false;
+    setHandModeLock(false);
+    elements.handEnable.textContent = 'カメラを有効化';
+    return;
+  }
+  if (prompts.length < 2) {
+    updateHandStatus('error', '手制御には2個以上のプロンプトが必要です。');
+    return;
+  }
+
+  setMixMode('list');
+  captureHandBaseline();
+  elements.handEnable.disabled = true;
+  try {
+    await handController.start();
+    handActive = true;
+    setHandModeLock(true);
+    elements.handEnable.disabled = false;
+    elements.handEnable.textContent = 'カメラを停止';
+  } catch (error) {
+    handController.stop(false);
+    handActive = false;
+    setHandModeLock(false);
+    elements.handEnable.disabled = false;
+    elements.handEnable.textContent = 'カメラを有効化';
+    updateHandStatus('error', `カメラを開始できません: ${error.message}`);
+  }
 }
 
 function midiConditioningEnabled() {
@@ -525,7 +789,7 @@ async function createAudioPlayer() {
       `AudioContextが48 kHzではありません (${actualSampleRate} Hz)。`,
     );
   }
-  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=3');
+  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=5');
   playerNode = new AudioWorkletNode(audioContext, 'mrt2-pcm-player', {
     numberOfInputs: 0,
     numberOfOutputs: 1,
@@ -769,6 +1033,10 @@ elements.computerKeyboard.addEventListener('change', () => {
 elements.autoStrum.addEventListener('change', sendMidiConfig);
 elements.midiSolo.addEventListener('change', sendMidiConfig);
 elements.midiPanic.addEventListener('click', allNotesOff);
+elements.handEnable.addEventListener('click', toggleHandControl);
+elements.handPrompt.addEventListener('change', captureHandBaseline);
+elements.handPinchMode.addEventListener('click', () => setHandControlMode('pinch'));
+elements.handGestureMode.addEventListener('click', () => setHandControlMode('gesture'));
 elements.octaveDown.addEventListener('click', () => {
   keyboardBaseNote = Math.max(24, keyboardBaseNote - 12);
   updateMidiUi();
@@ -796,5 +1064,6 @@ if ('ResizeObserver' in window) {
 
 renderPrompts();
 setMixMode('list');
+setHandControlMode('pinch');
 setControls(false);
 updateMidiUi();

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MRT2 Linux Real-time</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/style.css?v=3" />
+    <link rel="stylesheet" href="/static/style.css?v=5" />
   </head>
   <body>
     <main class="shell">
@@ -111,6 +111,84 @@
         </p>
       </section>
 
+      <section class="panel hand-panel">
+        <div class="section-heading hand-heading">
+          <div>
+            <p class="section-kicker">GESTURE MODULATION</p>
+            <h2>Hand Landmark Control</h2>
+          </div>
+          <div class="hand-activity">
+            <span id="hand-led" class="hand-led"></span>
+            <span id="hand-status">カメラ停止中</span>
+          </div>
+        </div>
+
+        <div class="hand-layout">
+          <div id="hand-camera-stage" class="hand-camera-stage">
+            <video id="hand-video" muted playsinline></video>
+            <canvas id="hand-canvas"></canvas>
+            <div class="camera-placeholder">CAMERA</div>
+          </div>
+
+          <div class="hand-controls">
+            <div class="hand-toolbar">
+              <button id="hand-enable" class="secondary">カメラを有効化</button>
+              <div class="mode-switch" aria-label="hand control mode">
+                <button id="hand-pinch-mode" class="mode active">Pinch</button>
+                <button id="hand-gesture-mode" class="mode">Gesture Map</button>
+              </div>
+            </div>
+
+            <div id="hand-pinch-controls">
+              <div class="hand-device-row">
+                <span class="control-label">制御するプロンプト</span>
+                <select id="hand-prompt" aria-label="hand controlled prompt"></select>
+              </div>
+              <label class="check-control hand-invert">
+                <input id="hand-invert" type="checkbox" />
+                <span>開閉を反転（ピンチで100%）</span>
+              </label>
+            </div>
+
+            <div id="hand-gesture-map" class="hand-gesture-map" hidden>
+              <div class="gesture-map-row">
+                <span><b>✌</b> ピース</span>
+                <select id="gesture-victory" aria-label="victory prompt"></select>
+              </div>
+              <div class="gesture-map-row">
+                <span><b>✋</b> 手のひら</span>
+                <select id="gesture-open-palm" aria-label="open palm prompt"></select>
+              </div>
+              <div class="gesture-map-row">
+                <span><b>🦊</b> キツネ</span>
+                <select id="gesture-fox" aria-label="fox prompt"></select>
+              </div>
+              <div class="gesture-map-row">
+                <span><b>✊</b> 握りこぶし</span>
+                <select id="gesture-closed-fist" aria-label="closed fist prompt"></select>
+              </div>
+              <p class="hint">
+                左右の手を同時認識します。異なるジェスチャーは対応するプロンプトを同時にブレンドします。
+              </p>
+            </div>
+
+            <div class="hand-meter-row">
+              <span id="hand-meter-label">Prompt strength</span>
+              <strong id="hand-strength">—</strong>
+            </div>
+            <div class="hand-meter" aria-hidden="true">
+              <span id="hand-meter-fill"></span>
+            </div>
+            <p id="hand-control-hint" class="hint">
+              親指と人差し指を閉じると0%、広げると100%。選択したプロンプト以外の比率を保ったまま連続制御します。
+            </p>
+            <p class="hint hand-privacy">
+              映像処理は手元ブラウザ内のみです。初回はMediaPipeモデルの読み込みに時間がかかります。
+            </p>
+          </div>
+        </div>
+      </section>
+
       <section class="metric-grid" aria-label="stream metrics">
         <article class="metric">
           <span>生成時間</span>
@@ -147,6 +225,6 @@
         </dl>
       </section>
     </main>
-    <script type="module" src="/static/app.js?v=3"></script>
+    <script type="module" src="/static/app.js?v=5"></script>
   </body>
 </html>

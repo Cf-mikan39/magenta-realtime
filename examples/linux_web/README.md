@@ -61,6 +61,30 @@ is observed for one frame.
 The PC keyboard mapping follows the official app: A/W/S/E/D/F/T/G/Y/H/U/J
 starts at C3, K/O/L/P/; continues above it, and Z/X changes octave.
 
+## Hand landmark and gesture control
+
+The hand controller runs entirely in the local browser and does not upload
+camera frames to the GPU server. It has two modes:
+
+- **Pinch** maps the normalized thumb/index distance to one prompt. A closed
+  pinch is 0% and a wide spread is 100%; **Invert** reverses the mapping.
+- **Gesture Map** assigns Victory/peace, Open Palm, Fox, and Closed Fist to
+  prompt slots. MediaPipe's canned recognizer handles all but Fox; Fox is
+  classified from finger extension and thumb-contact landmarks.
+
+Gesture Map tracks up to two hands. Two different simultaneous gestures blend
+their assigned prompts using smoothed recognition confidence. Recognition must
+persist for two frames before switching, and the last recognized gesture is
+held for 320 ms through brief tracking loss. Detection is limited to about
+15 fps, independently of the audio-generation loop.
+
+The first launch downloads the pinned MediaPipe Tasks Vision runtime and the
+official Gesture Recognizer model in the browser. Camera access requires
+a secure browser context; `http://127.0.0.1` through the SSH tunnel qualifies,
+but a plain remote-server HTTP address usually does not. Chrome or Edge is
+recommended. Camera inference is local and independent of the JAX/CUDA audio
+generation thread.
+
 Only one WebSocket stream may own the model at a time. This is deliberate: two
 concurrent generation loops would compete for the same GPU and invalidate the
 real-time latency measurements.
