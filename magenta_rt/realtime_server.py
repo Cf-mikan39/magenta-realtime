@@ -18,11 +18,14 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 import logging
 import math
+from pathlib import Path
 import threading
 import time
 from typing import Any
+import wave
 
 import numpy as np
 
@@ -357,6 +360,82 @@ class SamplingConditioning:
     return SamplingSnapshot(
         temperature=self._temperature,
         top_k=self._top_k,
+        revision=self._revision,
+    )
+
+
+@dataclass(frozen=True)
+class RecordingSnapshot:
+  """Current server-side WAV recording state."""
+
+  active: bool
+  path: str | None
+  duration_seconds: float
+  revision: int
+
+
+class WavRecorder:
+  """Write the exact browser-bound stream to a stereo PCM16 WAV file."""
+
+  def __init__(self, output_dir: str | Path = "outputs"):
+    self._output_dir = Path(output_dir)
+    self._writer = None
+    self._path: Path | None = None
+    self._sample_frames = 0
+    self._revision = 0
+    self._lock = threading.Lock()
+
+  def start(self) -> RecordingSnapshot:
+    with self._lock:
+      if self._writer is not None:
+        return self._snapshot_locked()
+      self._output_dir.mkdir(parents=True, exist_ok=True)
+      timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+      self._path = self._output_dir / f"mrt2_recording_{timestamp}.wav"
+      writer = wave.open(str(self._path), "wb")
+      writer.setnchannels(CHANNELS)
+      writer.setsampwidth(2)
+      writer.setframerate(SAMPLE_RATE)
+      self._writer = writer
+      self._sample_frames = 0
+      self._revision += 1
+      return self._snapshot_locked()
+
+  def write(self, samples: np.ndarray) -> None:
+    values = np.asarray(samples, dtype=np.float32)
+    if values.ndim != 2 or values.shape[1] != CHANNELS:
+      raise ValueError(f"recording samples must have shape [N, {CHANNELS}]")
+    pcm = np.rint(
+        np.clip(np.nan_to_num(values), -1.0, 1.0) * 32767.0
+    ).astype("<i2")
+    with self._lock:
+      if self._writer is None:
+        return
+      self._writer.writeframesraw(pcm.tobytes(order="C"))
+      self._sample_frames += len(values)
+
+  def stop(self) -> RecordingSnapshot:
+    with self._lock:
+      if self._writer is None:
+        return self._snapshot_locked()
+      writer = self._writer
+      self._writer = None
+      writer.close()
+      if self._sample_frames == 0 and self._path is not None:
+        self._path.unlink(missing_ok=True)
+        self._path = None
+      self._revision += 1
+      return self._snapshot_locked()
+
+  def snapshot(self) -> RecordingSnapshot:
+    with self._lock:
+      return self._snapshot_locked()
+
+  def _snapshot_locked(self) -> RecordingSnapshot:
+    return RecordingSnapshot(
+        active=self._writer is not None,
+        path=str(self._path) if self._path is not None else None,
+        duration_seconds=self._sample_frames / SAMPLE_RATE,
         revision=self._revision,
     )
 

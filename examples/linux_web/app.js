@@ -2,12 +2,12 @@ import {
   canonicalHandedness,
   HandPromptController,
   hybridPromptWeights,
-} from './hand-control.js?v=9';
+} from './hand-control.js?v=10';
 import {
   lfoValue,
   mapModulationRange,
   midiCcValue,
-} from './modulation.js?v=9';
+} from './modulation.js?v=10';
 
 const COLORS = ['#9b8cff', '#4ed6b2', '#ffb95e', '#ff7891', '#64b5ff', '#d98cff'];
 const MAX_PROMPTS = 6;
@@ -34,6 +34,9 @@ const KEY_TO_SEMITONE = {
 const elements = {
   start: document.querySelector('#start'),
   stop: document.querySelector('#stop'),
+  recordStart: document.querySelector('#record-start'),
+  recordStop: document.querySelector('#record-stop'),
+  recordStatus: document.querySelector('#record-status'),
   apply: document.querySelector('#apply'),
   addPrompt: document.querySelector('#add-prompt'),
   listMode: document.querySelector('#list-mode'),
@@ -129,6 +132,11 @@ let serverUnderruns = 0;
 let browserUnderruns = 0;
 let requestId = 0;
 let stopping = false;
+let recordingArmed = false;
+let recordingActive = false;
+let recordingRequestPending = false;
+let recordingPath = null;
+let recordingDurationSeconds = 0;
 let weightTimer = null;
 let samplingTimer = null;
 let surfaceDrag = null;
@@ -182,6 +190,57 @@ function setControls(running) {
   elements.stop.disabled = !running;
   elements.apply.disabled = !running || !bankDirty;
   elements.addPrompt.disabled = prompts.length >= MAX_PROMPTS;
+}
+
+function updateRecordingUi(message = null) {
+  const activeOrArmed = recordingActive || recordingArmed;
+  elements.recordStart.disabled = activeOrArmed || recordingRequestPending;
+  elements.recordStop.disabled = !activeOrArmed || recordingRequestPending;
+  elements.recordStart.classList.toggle('recording', activeOrArmed);
+  elements.recordStart.textContent = recordingActive
+    ? '● 録音中'
+    : recordingArmed ? '● 録音待機' : '● 録音';
+  if (message !== null) {
+    elements.recordStatus.textContent = message;
+  } else if (recordingActive) {
+    elements.recordStatus.textContent = `${recordingDurationSeconds.toFixed(1)}秒を録音中`;
+  } else if (recordingArmed) {
+    elements.recordStatus.textContent = '再生開始時に録音します';
+  } else if (recordingPath) {
+    elements.recordStatus.textContent = `保存済み: ${recordingPath}`;
+    elements.recordStatus.title = recordingPath;
+  } else {
+    elements.recordStatus.textContent = '録音停止中';
+    elements.recordStatus.title = '';
+  }
+}
+
+function startRecording() {
+  if (recordingActive || recordingArmed || recordingRequestPending) return;
+  recordingPath = null;
+  recordingDurationSeconds = 0;
+  recordingArmed = true;
+  if (socket?.readyState === WebSocket.OPEN) {
+    recordingRequestPending = true;
+    socket.send(JSON.stringify({ type: 'recording_config', enabled: true }));
+    updateRecordingUi('録音を開始しています…');
+  } else {
+    updateRecordingUi();
+  }
+}
+
+function stopRecording() {
+  if (recordingRequestPending) return;
+  if (recordingActive && socket?.readyState === WebSocket.OPEN) {
+    recordingRequestPending = true;
+    socket.send(JSON.stringify({ type: 'recording_config', enabled: false }));
+    updateRecordingUi('WAVを確定しています…');
+    return;
+  }
+  recordingArmed = false;
+  recordingActive = false;
+  recordingDurationSeconds = 0;
+  updateRecordingUi('録音待機を解除しました');
 }
 
 function markBankDirty() {
@@ -1194,7 +1253,7 @@ async function createAudioPlayer() {
       `AudioContextが48 kHzではありません (${actualSampleRate} Hz)。`,
     );
   }
-  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=9');
+  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=10');
   playerNode = new AudioWorkletNode(audioContext, 'mrt2-pcm-player', {
     numberOfInputs: 0,
     numberOfOutputs: 1,
@@ -1234,16 +1293,21 @@ async function destroyAudioPlayer() {
 function handleControlMessage(message) {
   switch (message.type) {
     case 'hello':
-      if (message.protocol_version < 4) {
+      if (message.protocol_version < 5) {
         throw new Error('サーバーのWebSocketプロトコルが古いバージョンです。');
       }
       elements.model.textContent = message.model;
       elements.audioFormat.textContent =
         `${message.sample_rate / 1_000} kHz · stereo · ${message.pcm_format}`;
+      if (recordingArmed) {
+        recordingRequestPending = true;
+        updateRecordingUi('再生開始と同時に録音を開始します…');
+      }
       socket.send(JSON.stringify({
         type: 'start',
         prompts: promptPayload(),
         sampling: samplingPayload(),
+        recording: recordingArmed,
       }));
       setStatus(`${prompts.length}個の初期プロンプトを送信しました。`, 'working');
       break;
@@ -1264,6 +1328,12 @@ function handleControlMessage(message) {
         elements.topK.value = String(message.sampling.top_k);
         syncSamplingControls();
       }
+      recordingRequestPending = false;
+      recordingActive = Boolean(message.recording?.active);
+      recordingArmed = recordingActive;
+      recordingPath = message.recording?.path ?? recordingPath;
+      recordingDurationSeconds = message.recording?.duration_seconds ?? 0;
+      updateRecordingUi();
       sendMidiConfig();
       sendDrumConfig();
       for (const pitch of activeMidiNotes) sendMidiNote(pitch, true);
@@ -1306,6 +1376,25 @@ function handleControlMessage(message) {
       break;
     case 'sampling_config_applied':
       break;
+    case 'recording_config_applied':
+      recordingRequestPending = false;
+      recordingActive = Boolean(message.active);
+      recordingArmed = recordingActive;
+      recordingPath = message.path ?? recordingPath;
+      recordingDurationSeconds = message.duration_seconds ?? 0;
+      updateRecordingUi();
+      break;
+    case 'recording_saved':
+      recordingRequestPending = false;
+      recordingActive = false;
+      recordingArmed = false;
+      recordingPath = message.path;
+      recordingDurationSeconds = message.duration_seconds ?? 0;
+      updateRecordingUi(
+        `保存済み: ${message.path} (${recordingDurationSeconds.toFixed(1)}秒)`,
+      );
+      elements.recordStatus.title = message.path;
+      break;
     case 'metrics':
       elements.generationMs.textContent =
         `${message.generation_ms_latest.toFixed(1)} ms`;
@@ -1314,6 +1403,12 @@ function handleControlMessage(message) {
       elements.deadlineMisses.textContent = message.generation_deadline_misses;
       elements.revision.textContent = message.prompt_revision;
       serverUnderruns = message.server_underrun_frames;
+      if (message.recording_active) {
+        recordingActive = true;
+        recordingArmed = true;
+        recordingDurationSeconds = message.recording_duration_seconds ?? 0;
+        updateRecordingUi();
+      }
       updateUnderruns();
       break;
     case 'control_error':
@@ -1364,6 +1459,15 @@ async function start() {
       allNotesOff();
       await destroyAudioPlayer();
       setControls(false);
+      const recordingWasActive = recordingActive || recordingRequestPending;
+      recordingActive = false;
+      recordingArmed = false;
+      recordingRequestPending = false;
+      if (recordingWasActive && !recordingPath) {
+        updateRecordingUi('接続終了時にサーバー側でWAVを確定しました');
+      } else {
+        updateRecordingUi();
+      }
       if (stopping) {
         setStatus('停止しました。', 'idle');
       } else if (!elements.pill.classList.contains('error')) {
@@ -1408,8 +1512,8 @@ function stop() {
     samplingTimer = null;
   }
   if (socket && socket.readyState === WebSocket.OPEN) {
+    elements.stop.disabled = true;
     socket.send(JSON.stringify({ type: 'stop' }));
-    socket.close(1000, 'user stopped playback');
   } else {
     socket = null;
     destroyAudioPlayer();
@@ -1421,6 +1525,8 @@ function stop() {
 
 elements.start.addEventListener('click', start);
 elements.stop.addEventListener('click', stop);
+elements.recordStart.addEventListener('click', startRecording);
+elements.recordStop.addEventListener('click', stopRecording);
 elements.apply.addEventListener('click', applyPrompts);
 elements.addPrompt.addEventListener('click', () => {
   if (prompts.length >= MAX_PROMPTS) return;
@@ -1533,3 +1639,4 @@ updateMidiUi();
 syncLfoControls();
 syncSamplingControls();
 updateCcHint();
+updateRecordingUi();

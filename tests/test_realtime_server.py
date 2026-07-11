@@ -15,7 +15,9 @@
 """Tests for the dependency-light Linux/JAX WebSocket core."""
 
 import time
+import tempfile
 import unittest
+import wave
 
 import numpy as np
 
@@ -34,6 +36,7 @@ from magenta_rt.realtime_server import SamplingConditioning
 from magenta_rt.realtime_server import normalize_prompt_weights
 from magenta_rt.realtime_server import validate_prompt_definitions
 from magenta_rt.realtime_server import validate_prompt
+from magenta_rt.realtime_server import WavRecorder
 
 
 class _FakeWaveform:
@@ -278,6 +281,36 @@ class SamplingConditioningTest(unittest.TestCase):
     self.assertEqual(mrt.temperatures[0], 0.75)
     self.assertIn(1.5, mrt.temperatures)
     self.assertIn(96, mrt.top_ks)
+
+
+class WavRecorderTest(unittest.TestCase):
+
+  def test_writes_stereo_pcm16_wav(self):
+    with tempfile.TemporaryDirectory() as directory:
+      recorder = WavRecorder(directory)
+      started = recorder.start()
+      self.assertTrue(started.active)
+      samples = np.zeros((FRAME_SAMPLES, 2), dtype=np.float32)
+      samples[0] = [0.5, -0.5]
+      recorder.write(samples)
+      saved = recorder.stop()
+      self.assertFalse(saved.active)
+      self.assertAlmostEqual(saved.duration_seconds, 0.04)
+      self.assertIsNotNone(saved.path)
+      with wave.open(saved.path, "rb") as reader:
+        self.assertEqual(reader.getnchannels(), 2)
+        self.assertEqual(reader.getsampwidth(), 2)
+        self.assertEqual(reader.getframerate(), SAMPLE_RATE)
+        self.assertEqual(reader.getnframes(), FRAME_SAMPLES)
+        first_frame = np.frombuffer(reader.readframes(1), dtype="<i2")
+      np.testing.assert_array_equal(first_frame, [16384, -16384])
+
+  def test_empty_recording_is_removed(self):
+    with tempfile.TemporaryDirectory() as directory:
+      recorder = WavRecorder(directory)
+      recorder.start()
+      saved = recorder.stop()
+      self.assertIsNone(saved.path)
 
 
 class PcmEncodingTest(unittest.TestCase):

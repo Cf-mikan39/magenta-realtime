@@ -127,7 +127,37 @@ button:disabled { opacity: 0.42; cursor: not-allowed; }
 .primary { background: linear-gradient(135deg, #8d7cf5, #5e9df5); color: #fff; }
 .secondary { border: 1px solid #3a3f4b; background: #20242e; color: #e9ebef; }
 .hint { margin: 10px 0 0; color: #878d99; font-size: 12px; }
-.transport { display: flex; gap: 10px; margin-top: 24px; }
+.transport {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 24px;
+}
+
+.playback-controls,
+.record-controls { display: flex; align-items: center; gap: 8px; }
+
+.record-button {
+  border: 1px solid #8a3441;
+  background: #451a22;
+  color: #ff9ba7;
+}
+
+.record-button.recording {
+  background: #a62d3e;
+  color: #fff;
+  box-shadow: 0 0 18px #e13f5566;
+}
+
+#record-status {
+  max-width: 250px;
+  overflow: hidden;
+  color: #8f96a2;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .prompt-list { display: grid; gap: 9px; }
 
@@ -739,6 +769,8 @@ dd { margin: 5px 0 0; font-size: 13px; font-variant-numeric: tabular-nums; }
   .prompt-item .weight-control { grid-column: 2 / 4; }
   .prompt-list.surface-active .weight-control { display: none; }
   .prompt-actions { align-items: stretch; flex-direction: column; }
+  .transport { align-items: stretch; flex-direction: column; }
+  .playback-controls, .record-controls { flex-wrap: wrap; }
   .prompt-surface { height: 300px; }
   .global-controls,
   .modulation-grid,

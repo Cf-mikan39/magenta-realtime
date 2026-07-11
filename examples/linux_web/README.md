@@ -31,12 +31,6 @@ terminal and create an SSH tunnel:
 ssh -N -L 8000:127.0.0.1:8000 USER@GPU_SERVER
 ```
 
-For the current Rikyu setup, use the same SSH alias as the normal login:
-
-```sh
-ssh -N -L 8000:127.0.0.1:8000 ogata.kai.r5@out-rikyu
-```
-
 Then open <http://127.0.0.1:8000> in Chrome or Edge. Press **Start** and allow
 the browser to start Web Audio. Up to six prompt texts are embedded once and
 cached. Slider changes blend the cached embeddings immediately; text edits are
@@ -47,6 +41,21 @@ recurrent streaming state.
 The browser buffer starts at three frames. If an AudioWorklet underrun occurs,
 it automatically increases its target by one frame, up to six frames. This
 trades 40 ms of additional control latency for more scheduling-jitter margin.
+
+## Recording and WAV export
+
+Recording is performed on the GPU server from the exact frames sent to the
+browser. Press **Record** before playback to arm recording from the first
+streamed frame, or press it during playback to begin on the next 40 ms frame.
+Press **Stop Recording** to finalize the file while playback continues. Pressing
+the main **Stop** button also finalizes an active recording before the WebSocket
+is closed.
+
+Files are written under `outputs/` as
+`mrt2_recording_YYYYMMDD_HHMMSS_mmm.wav`. The format is 48 kHz, stereo, signed
+16-bit PCM for broad player and DAW compatibility. The browser shows the saved
+relative path and duration, and the backend logs the same path. Empty armed
+recordings are removed. `outputs/` is already excluded by `.gitignore`.
 
 ## Web MIDI
 

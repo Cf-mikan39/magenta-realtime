@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MRT2 Linux Real-time</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/style.css?v=9" />
+    <link rel="stylesheet" href="/static/style.css?v=10" />
   </head>
   <body>
     <main class="shell">
@@ -58,8 +58,15 @@
         </p>
 
         <div class="transport">
-          <button id="start" class="primary">再生開始</button>
-          <button id="stop" class="secondary" disabled>停止</button>
+          <div class="playback-controls">
+            <button id="start" class="primary">再生開始</button>
+            <button id="stop" class="secondary" disabled>停止</button>
+          </div>
+          <div class="record-controls">
+            <button id="record-start" class="record-button">● 録音</button>
+            <button id="record-stop" class="secondary" disabled>録音停止</button>
+            <span id="record-status">録音停止中</span>
+          </div>
         </div>
       </section>
 
@@ -358,6 +365,6 @@
         </dl>
       </section>
     </main>
-    <script type="module" src="/static/app.js?v=9"></script>
+    <script type="module" src="/static/app.js?v=10"></script>
   </body>
 </html>

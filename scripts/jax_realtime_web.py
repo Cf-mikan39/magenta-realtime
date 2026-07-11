@@ -45,6 +45,7 @@ from magenta_rt.realtime_server import SAMPLE_RATE
 from magenta_rt.realtime_server import SamplingConditioning
 from magenta_rt.realtime_server import validate_prompt
 from magenta_rt.realtime_server import validate_prompt_definitions
+from magenta_rt.realtime_server import WavRecorder
 
 
 LOGGER = logging.getLogger("jax_realtime_web")
@@ -193,6 +194,7 @@ async def _run_stream(
       temperature=getattr(mrt, "temperature", 1.1),
       top_k=getattr(mrt, "top_k", 50),
   )
+  recorder = WavRecorder("outputs")
   send_lock = asyncio.Lock()
 
   async def send_json(message: dict) -> None:
@@ -203,7 +205,7 @@ async def _run_stream(
     await send_json(
         {
             "type": "hello",
-            "protocol_version": 4,
+            "protocol_version": 5,
             "model": model_name,
             "sample_rate": SAMPLE_RATE,
             "channels": CHANNELS,
@@ -243,6 +245,11 @@ async def _run_stream(
           temperature=initial_sampling.get("temperature"),
           top_k=initial_sampling.get("top_k"),
       )
+    initial_recording = start_message.get("recording", False)
+    if not isinstance(initial_recording, bool):
+      raise ValueError("recording must be a boolean")
+    if initial_recording:
+      recorder.start()
 
     await send_json(
         {
@@ -300,6 +307,11 @@ async def _run_stream(
                 "temperature": sampling.snapshot().temperature,
                 "top_k": sampling.snapshot().top_k,
             },
+            "recording": {
+                "active": recorder.snapshot().active,
+                "path": recorder.snapshot().path,
+                "duration_seconds": recorder.snapshot().duration_seconds,
+            },
         }
     )
     LOGGER.info(
@@ -318,6 +330,7 @@ async def _run_stream(
             midi=midi,
             drums=drums,
             sampling=sampling,
+            recorder=recorder,
         ),
         name="mrt2-websocket-audio-sender",
     )
@@ -331,6 +344,7 @@ async def _run_stream(
             midi=midi,
             drums=drums,
             sampling=sampling,
+            recorder=recorder,
         ),
         name="mrt2-websocket-control-receiver",
     )
@@ -360,6 +374,14 @@ async def _run_stream(
         LOGGER.error("JAX producer did not stop within five seconds")
     elif ring_buffer is not None:
       ring_buffer.close()
+    recording_was_active = recorder.snapshot().active
+    recording = recorder.stop()
+    if recording_was_active and recording.path is not None:
+      LOGGER.info(
+          "Recording saved: %s (%.2f s)",
+          recording.path,
+          recording.duration_seconds,
+      )
     with contextlib.suppress(Exception):
       await websocket.close()
     LOGGER.info("Browser stream stopped")
@@ -367,7 +389,7 @@ async def _run_stream(
 
 async def _send_audio(
     *, websocket, send_lock, send_json, ring_buffer, producer, midi, drums,
-    sampling
+    sampling, recorder
 ) -> None:
   sequence = 0
   underrun_frames = 0
@@ -400,6 +422,7 @@ async def _send_audio(
     samples, missing = ring_buffer.read(
         FRAME_SAMPLES, zero_pad=True, timeout=0.0
     )
+    recorder.write(samples)
     underrun_frames += int(missing > 0)
     missing_samples_total += missing
     async with send_lock:
@@ -412,6 +435,7 @@ async def _send_audio(
       midi_stats = midi.snapshot()
       drum_stats = drums.snapshot()
       sampling_stats = sampling.snapshot()
+      recording_stats = recorder.snapshot()
       await send_json(
           {
               "type": "metrics",
@@ -436,6 +460,8 @@ async def _send_audio(
               "temperature": sampling_stats.temperature,
               "top_k": sampling_stats.top_k,
               "sampling_revision": sampling_stats.revision,
+              "recording_active": recording_stats.active,
+              "recording_duration_seconds": recording_stats.duration_seconds,
           }
       )
 
@@ -483,13 +509,52 @@ async def _encode_definitions(
 
 async def _receive_controls(
     *, websocket, send_json, mrt, prompt, embedding_cache, midi, drums,
-    sampling
+    sampling, recorder
 ) -> None:
   while True:
     message = await websocket.receive_json()
     message_type = message.get("type")
     if message_type == "stop":
+      recording = recorder.stop()
+      if recording.path is not None:
+        await send_json(
+            {
+                "type": "recording_saved",
+                "path": recording.path,
+                "duration_seconds": recording.duration_seconds,
+            }
+        )
+        LOGGER.info(
+            "Recording saved: %s (%.2f s)",
+            recording.path,
+            recording.duration_seconds,
+        )
       return
+
+    if message_type == "recording_config":
+      enabled = message.get("enabled")
+      if not isinstance(enabled, bool):
+        await send_json(
+            {"type": "control_error", "message": "recording enabled must be a boolean"}
+        )
+        continue
+      recording = recorder.start() if enabled else recorder.stop()
+      await send_json(
+          {
+              "type": "recording_config_applied",
+              "active": recording.active,
+              "path": recording.path,
+              "duration_seconds": recording.duration_seconds,
+              "recording_revision": recording.revision,
+          }
+      )
+      if not recording.active and recording.path is not None:
+        LOGGER.info(
+            "Recording saved: %s (%.2f s)",
+            recording.path,
+            recording.duration_seconds,
+        )
+      continue
 
     if message_type == "midi_config":
       try:

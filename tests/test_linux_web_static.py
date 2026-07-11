@@ -26,12 +26,12 @@ class LinuxWebStaticTest(unittest.TestCase):
   def test_static_asset_cache_versions_match(self):
     html = (WEB_ROOT / "index.html").read_text()
     javascript = (WEB_ROOT / "app.js").read_text()
-    self.assertIn("/static/style.css?v=9", html)
-    self.assertIn("/static/app.js?v=9", html)
-    self.assertIn("./hand-control.js?v=9", javascript)
-    self.assertIn("./modulation.js?v=9", javascript)
-    self.assertIn("/static/audio-worklet.js?v=9", javascript)
-    self.assertIn("message.protocol_version < 4", javascript)
+    self.assertIn("/static/style.css?v=10", html)
+    self.assertIn("/static/app.js?v=10", html)
+    self.assertIn("./hand-control.js?v=10", javascript)
+    self.assertIn("./modulation.js?v=10", javascript)
+    self.assertIn("/static/audio-worklet.js?v=10", javascript)
+    self.assertIn("message.protocol_version < 5", javascript)
 
 
 if __name__ == "__main__":
