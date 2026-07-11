@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MRT2 Linux Real-time</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/style.css?v=2" />
+    <link rel="stylesheet" href="/static/style.css?v=3" />
   </head>
   <body>
     <main class="shell">
@@ -63,6 +63,54 @@
         </div>
       </section>
 
+      <section class="panel midi-panel">
+        <div class="section-heading midi-heading">
+          <div>
+            <p class="section-kicker">NOTE CONDITIONING</p>
+            <h2>Web MIDI</h2>
+          </div>
+          <div class="midi-activity">
+            <span id="midi-led" class="midi-led"></span>
+            <span id="midi-status">未接続</span>
+          </div>
+        </div>
+
+        <div class="midi-device-row">
+          <button id="midi-enable" class="secondary">MIDIを有効化</button>
+          <select id="midi-input" disabled aria-label="MIDI input device">
+            <option value="">MIDIデバイスなし</option>
+          </select>
+        </div>
+
+        <div class="midi-options">
+          <label class="check-control">
+            <input id="computer-keyboard" type="checkbox" />
+            <span>PCキーボード</span>
+          </label>
+          <label class="check-control">
+            <input id="auto-strum" type="checkbox" checked />
+            <span>Auto-Strum</span>
+          </label>
+          <label class="check-control">
+            <input id="midi-solo" type="checkbox" />
+            <span>Solo</span>
+          </label>
+          <div class="octave-control">
+            <button id="octave-down" class="mini-button">−</button>
+            <span id="octave-label">Keyboard C3</span>
+            <button id="octave-up" class="mini-button">＋</button>
+          </div>
+          <button id="midi-panic" class="mini-button">All Notes Off</button>
+        </div>
+
+        <div id="midi-notes" class="midi-notes" aria-label="active MIDI notes">
+          <span>Active notes: —</span>
+        </div>
+        <p class="hint">
+          PCキーボード: A/W/S/E/D/F/T/G/Y/H/U/J/K/O/L/P/;、Z/Xでオクターブ変更。
+        </p>
+      </section>
+
       <section class="metric-grid" aria-label="stream metrics">
         <article class="metric">
           <span>生成時間</span>
@@ -99,6 +147,6 @@
         </dl>
       </section>
     </main>
-    <script type="module" src="/static/app.js?v=2"></script>
+    <script type="module" src="/static/app.js?v=3"></script>
   </body>
 </html>

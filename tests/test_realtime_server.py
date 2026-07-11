@@ -24,6 +24,7 @@ from magenta_rt.realtime_server import blend_style_embeddings
 from magenta_rt.realtime_server import encode_pcm_f32le
 from magenta_rt.realtime_server import FRAME_SAMPLES
 from magenta_rt.realtime_server import JaxRealtimeProducer
+from magenta_rt.realtime_server import MidiConditioning
 from magenta_rt.realtime_server import PromptConditioning
 from magenta_rt.realtime_server import PromptDefinition
 from magenta_rt.realtime_server import PromptMixer
@@ -46,9 +47,11 @@ class _FakeMrt:
 
   def __init__(self):
     self.states = []
+    self.notes = []
 
-  def generate(self, *, style, frames, state):
+  def generate(self, *, style, frames, state, notes=None):
     self.states.append(state)
+    self.notes.append(notes)
     next_state = 1 if state is None else state + 1
     return _FakeWaveform(float(style)), next_state
 
@@ -133,6 +136,63 @@ class PromptMixerTest(unittest.TestCase):
     self.assertEqual(updated.revision, 1)
     self.assertEqual(mixer.definitions()[0].text, "new")
     np.testing.assert_array_equal(updated.style, [0.0, 1.0])
+
+
+class MidiConditioningTest(unittest.TestCase):
+
+  def test_disabled_midi_is_unconditioned(self):
+    midi = MidiConditioning()
+    self.assertIsNone(midi.frame_tokens())
+
+  def test_onset_then_sustain_in_explicit_onset_mode(self):
+    midi = MidiConditioning(enabled=True, auto_strum=False, unmask_width=4)
+    midi.note_on(60)
+    onset = midi.frame_tokens()
+    sustain = midi.frame_tokens()
+    self.assertEqual(onset[60], 2)
+    self.assertEqual(sustain[60], 1)
+    self.assertTrue(
+        all(
+            onset[pitch] == 0
+            for pitch in range(56, 65)
+            if pitch != 60
+        )
+    )
+    self.assertEqual(onset[55], -1)
+    self.assertEqual(onset[65], -1)
+
+  def test_short_note_is_latched_for_one_frame(self):
+    midi = MidiConditioning(enabled=True, auto_strum=False)
+    midi.note_on(64)
+    midi.note_off(64)
+    self.assertEqual(midi.frame_tokens()[64], 2)
+    self.assertEqual(midi.frame_tokens()[64], -1)
+
+  def test_auto_strum_and_solo_modes(self):
+    midi = MidiConditioning(
+        enabled=True, auto_strum=True, unmask_width=127
+    )
+    midi.note_on(67)
+    tokens = midi.frame_tokens()
+    self.assertEqual(tokens[67], 3)
+    self.assertEqual(tokens.count(0), 127)
+
+  def test_producer_passes_midi_tokens_to_model(self):
+    mrt = _FakeMrt()
+    midi = MidiConditioning(enabled=True, auto_strum=False)
+    midi.note_on(72)
+    ring = StereoRingBuffer(FRAME_SAMPLES)
+    producer = JaxRealtimeProducer(
+        mrt=mrt,
+        prompt=PromptConditioning("one", 0.5),
+        ring_buffer=ring,
+        midi=midi,
+    )
+    producer.start()
+    self.assertTrue(ring.wait_for_available(FRAME_SAMPLES, timeout=1.0))
+    producer.stop()
+    producer.join(timeout=1.0)
+    self.assertEqual(mrt.notes[0][72], 2)
 
 
 class PcmEncodingTest(unittest.TestCase):

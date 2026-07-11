@@ -21,6 +21,12 @@ terminal and create an SSH tunnel:
 ssh -N -L 8000:127.0.0.1:8000 USER@GPU_SERVER
 ```
 
+For the current Rikyu setup, use the same SSH alias as the normal login:
+
+```sh
+ssh -N -L 8000:127.0.0.1:8000 ogata.kai.r5@out-rikyu
+```
+
 Then open <http://127.0.0.1:8000> in Chrome or Edge. Press **Start** and allow
 the browser to start Web Audio. Up to six prompt texts are embedded once and
 cached. Slider changes blend the cached embeddings immediately; text edits are
@@ -31,6 +37,25 @@ recurrent streaming state.
 The browser buffer starts at three frames. If an AudioWorklet underrun occurs,
 it automatically increases its target by one frame, up to six frames. This
 trades 40 ms of additional control latency for more scheduling-jitter margin.
+
+## Web MIDI
+
+Open the page in local Chrome or Edge through the SSH tunnel, then press
+**Enable MIDI** and grant browser permission. Select a physical MIDI input, or
+enable **PC keyboard** for testing without hardware. MIDI note-on/off events
+are latched on the server so even a note shorter than one 40 ms inference frame
+is observed for one frame.
+
+- **Auto-Strum on** sends token 3 while a note is held, allowing the model to
+  retrigger, bow, strum, or arpeggiate it.
+- **Auto-Strum off** sends an onset token followed by continuation tokens.
+- **Solo off** unmasks four neighboring pitches and lets MRT2 add
+  accompaniment.
+- **Solo on** explicitly marks every non-held pitch off.
+- Sustain pedal CC64 and All Notes Off CC120/CC123 are supported in the browser.
+
+The PC keyboard mapping follows the official app: A/W/S/E/D/F/T/G/Y/H/U/J
+starts at C3, K/O/L/P/; continues above it, and Z/X changes octave.
 
 Only one WebSocket stream may own the model at a time. This is deliberate: two
 concurrent generation loops would compete for the same GPU and invalidate the

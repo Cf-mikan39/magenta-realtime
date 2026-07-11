@@ -1,6 +1,10 @@
 const COLORS = ['#9b8cff', '#4ed6b2', '#ffb95e', '#ff7891', '#64b5ff', '#d98cff'];
 const MAX_PROMPTS = 6;
 const WEIGHT_SEND_INTERVAL_MS = 40;
+const KEY_TO_SEMITONE = {
+  a: 0, w: 1, s: 2, e: 3, d: 4, f: 5, t: 6, g: 7,
+  y: 8, h: 9, u: 10, j: 11, k: 12, o: 13, l: 14, p: 15, ';': 16,
+};
 
 const elements = {
   start: document.querySelector('#start'),
@@ -25,6 +29,18 @@ const elements = {
   underruns: document.querySelector('#underruns'),
   deadlineMisses: document.querySelector('#deadline-misses'),
   audioFormat: document.querySelector('#audio-format'),
+  midiEnable: document.querySelector('#midi-enable'),
+  midiInput: document.querySelector('#midi-input'),
+  computerKeyboard: document.querySelector('#computer-keyboard'),
+  autoStrum: document.querySelector('#auto-strum'),
+  midiSolo: document.querySelector('#midi-solo'),
+  midiPanic: document.querySelector('#midi-panic'),
+  midiLed: document.querySelector('#midi-led'),
+  midiStatus: document.querySelector('#midi-status'),
+  midiNotes: document.querySelector('#midi-notes'),
+  octaveDown: document.querySelector('#octave-down'),
+  octaveUp: document.querySelector('#octave-up'),
+  octaveLabel: document.querySelector('#octave-label'),
 };
 
 let prompts = [
@@ -44,6 +60,13 @@ let requestId = 0;
 let stopping = false;
 let weightTimer = null;
 let surfaceDrag = null;
+let midiAccess = null;
+let selectedMidiInput = null;
+let sustainDown = false;
+let keyboardBaseNote = 48;
+const activeMidiNotes = new Set();
+const heldMidiNotes = new Set();
+const pressedComputerKeys = new Map();
 
 function setStatus(message, state = 'working') {
   elements.status.textContent = message;
@@ -198,7 +221,12 @@ function updateSurface() {
     node.style.setProperty('--node-color', COLORS[index % COLORS.length]);
     node.style.setProperty('--node-weight', normalized[index]);
     node.title = prompt.text || `Prompt ${index + 1}`;
-    node.innerHTML = `<span>${escapeHtml(prompt.text || `Prompt ${index + 1}`)}</span><b>${Math.round(normalized[index] * 100)}%</b>`;
+    node.innerHTML = `
+      <span class="node-dot"></span>
+      <span class="node-caption">
+        <span>${escapeHtml(prompt.text || `Prompt ${index + 1}`)}</span>
+        <b>${Math.round(normalized[index] * 100)}%</b>
+      </span>`;
     node.addEventListener('pointerdown', (event) => {
       beginSurfaceDrag(event, 'prompt', prompt.id);
     });
@@ -218,11 +246,15 @@ function escapeHtml(value) {
 }
 
 function calculateSurfaceWeights() {
-  const distancesSquared = prompts.map((prompt) =>
-    (prompt.x - listenerPosition.x) ** 2 +
-    (prompt.y - listenerPosition.y) ** 2
-  );
-  const exactIndex = distancesSquared.findIndex((distance) => distance < 0.00001);
+  const rect = elements.surface.getBoundingClientRect();
+  const width = Math.max(1, rect.width);
+  const height = Math.max(1, rect.height);
+  const distancesSquared = prompts.map((prompt) => {
+    const dx = (prompt.x - listenerPosition.x) * width;
+    const dy = (prompt.y - listenerPosition.y) * height;
+    return dx ** 2 + dy ** 2;
+  });
+  const exactIndex = distancesSquared.findIndex((distance) => distance < 1);
   if (exactIndex >= 0) {
     return prompts.map((_, index) => (index === exactIndex ? 1 : 0));
   }
@@ -242,12 +274,14 @@ function updateSurfaceDrag(event) {
   if (!surfaceDrag || event.pointerId !== surfaceDrag.pointerId) return;
   const rect = elements.surface.getBoundingClientRect();
   const x = Math.max(0.04, Math.min(0.96, (event.clientX - rect.left) / rect.width));
-  const y = Math.max(0.07, Math.min(0.93, (event.clientY - rect.top) / rect.height));
+  const rawY = (event.clientY - rect.top) / rect.height;
   if (surfaceDrag.type === 'listener') {
+    const y = Math.max(0.07, Math.min(0.93, rawY));
     listenerPosition = { x, y };
   } else {
     const prompt = prompts.find((candidate) => candidate.id === surfaceDrag.promptId);
     if (prompt) {
+      const y = Math.max(0.07, Math.min(0.82, rawY));
       prompt.x = x;
       prompt.y = y;
     }
@@ -295,6 +329,181 @@ function scheduleWeightUpdate() {
   }, WEIGHT_SEND_INTERVAL_MS);
 }
 
+function midiConditioningEnabled() {
+  return selectedMidiInput !== null || elements.computerKeyboard.checked;
+}
+
+function sendMidiConfig() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({
+    type: 'midi_config',
+    enabled: midiConditioningEnabled(),
+    auto_strum: elements.autoStrum.checked,
+    unmask_width: elements.midiSolo.checked ? 127 : 4,
+  }));
+}
+
+function sendMidiNote(pitch, on) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({ type: 'midi_note', pitch, on }));
+}
+
+function midiNoteOn(pitch) {
+  if (!Number.isInteger(pitch) || pitch < 0 || pitch > 127) return;
+  heldMidiNotes.add(pitch);
+  activeMidiNotes.add(pitch);
+  sendMidiNote(pitch, true);
+  updateMidiUi();
+}
+
+function midiNoteOff(pitch) {
+  heldMidiNotes.delete(pitch);
+  if (sustainDown) return;
+  if (activeMidiNotes.delete(pitch)) sendMidiNote(pitch, false);
+  updateMidiUi();
+}
+
+function setSustain(down) {
+  if (sustainDown === down) return;
+  sustainDown = down;
+  if (!sustainDown) {
+    for (const pitch of [...activeMidiNotes]) {
+      if (!heldMidiNotes.has(pitch)) {
+        activeMidiNotes.delete(pitch);
+        sendMidiNote(pitch, false);
+      }
+    }
+  }
+  updateMidiUi();
+}
+
+function allNotesOff() {
+  activeMidiNotes.clear();
+  heldMidiNotes.clear();
+  pressedComputerKeys.clear();
+  sustainDown = false;
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'midi_all_notes_off' }));
+  }
+  updateMidiUi();
+}
+
+function midiNoteName(pitch) {
+  const names = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
+  return `${names[pitch % 12]}${Math.floor(pitch / 12) - 1}`;
+}
+
+function updateMidiUi() {
+  const notes = [...activeMidiNotes].sort((a, b) => a - b);
+  elements.midiLed.classList.toggle('active', notes.length > 0);
+  elements.midiNotes.innerHTML = notes.length > 0
+    ? notes.map((pitch) => `<span class="midi-note">${midiNoteName(pitch)}<b>${pitch}</b></span>`).join('')
+    : '<span>Active notes: —</span>';
+
+  const sources = [];
+  if (selectedMidiInput) sources.push(selectedMidiInput.name || 'MIDI device');
+  if (elements.computerKeyboard.checked) sources.push('PC keyboard');
+  elements.midiStatus.textContent = sources.length > 0
+    ? `${sources.join(' + ')}${sustainDown ? ' · Sustain' : ''}`
+    : (midiAccess ? '入力を選択してください' : '未接続');
+  elements.octaveLabel.textContent = `Keyboard C${Math.floor(keyboardBaseNote / 12) - 1}`;
+}
+
+function attachMidiInput(input) {
+  if (selectedMidiInput) selectedMidiInput.onmidimessage = null;
+  allNotesOff();
+  selectedMidiInput = input;
+  if (selectedMidiInput) selectedMidiInput.onmidimessage = handleMidiMessage;
+  sendMidiConfig();
+  updateMidiUi();
+}
+
+function renderMidiInputs() {
+  const inputs = midiAccess ? [...midiAccess.inputs.values()] : [];
+  const connected = inputs.filter((input) => input.state !== 'disconnected');
+  const previousId = selectedMidiInput?.id ?? '';
+  elements.midiInput.replaceChildren();
+
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = connected.length > 0 ? '入力を選択' : 'MIDIデバイスなし';
+  elements.midiInput.append(none);
+  for (const input of connected) {
+    const option = document.createElement('option');
+    option.value = input.id;
+    option.textContent = input.name || `MIDI ${input.id}`;
+    elements.midiInput.append(option);
+  }
+  elements.midiInput.disabled = connected.length === 0;
+
+  const next = connected.find((input) => input.id === previousId) ?? connected[0] ?? null;
+  elements.midiInput.value = next?.id ?? '';
+  if (next !== selectedMidiInput) attachMidiInput(next);
+  updateMidiUi();
+}
+
+async function enableWebMidi() {
+  if (!navigator.requestMIDIAccess) {
+    elements.midiStatus.textContent = 'このブラウザはWeb MIDI非対応です';
+    setStatus('ChromeまたはEdgeでWeb MIDIを使用してください。', 'error');
+    return;
+  }
+  try {
+    midiAccess = await navigator.requestMIDIAccess({ sysex: false });
+    midiAccess.onstatechange = renderMidiInputs;
+    elements.midiEnable.textContent = 'MIDIを再スキャン';
+    renderMidiInputs();
+  } catch (error) {
+    elements.midiStatus.textContent = 'MIDIアクセス拒否';
+    setStatus(`MIDIを開始できません: ${error.message}`, 'error');
+  }
+}
+
+function handleMidiMessage(event) {
+  const [statusByte, data1, data2] = event.data;
+  const status = statusByte & 0xf0;
+  if (status === 0x90 && data2 > 0) {
+    midiNoteOn(data1);
+  } else if (status === 0x80 || (status === 0x90 && data2 === 0)) {
+    midiNoteOff(data1);
+  } else if (status === 0xb0 && data1 === 64) {
+    setSustain(data2 >= 64);
+  } else if (status === 0xb0 && (data1 === 120 || data1 === 123)) {
+    allNotesOff();
+  }
+}
+
+function computerKeyDown(event) {
+  if (!elements.computerKeyboard.checked || event.repeat) return;
+  const target = event.target;
+  if (target instanceof HTMLInputElement || target instanceof HTMLSelectElement) return;
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  const key = event.key.toLowerCase();
+  if (key === 'z' || key === 'x') {
+    keyboardBaseNote = Math.max(
+      24,
+      Math.min(84, keyboardBaseNote + (key === 'z' ? -12 : 12)),
+    );
+    updateMidiUi();
+    event.preventDefault();
+    return;
+  }
+  if (!(key in KEY_TO_SEMITONE)) return;
+  const pitch = keyboardBaseNote + KEY_TO_SEMITONE[key];
+  pressedComputerKeys.set(key, pitch);
+  midiNoteOn(pitch);
+  event.preventDefault();
+}
+
+function computerKeyUp(event) {
+  const key = event.key.toLowerCase();
+  const pitch = pressedComputerKeys.get(key);
+  if (pitch === undefined) return;
+  pressedComputerKeys.delete(key);
+  midiNoteOff(pitch);
+  event.preventDefault();
+}
+
 function updateUnderruns() {
   elements.underruns.textContent = `${serverUnderruns} / ${browserUnderruns}`;
 }
@@ -316,7 +525,7 @@ async function createAudioPlayer() {
       `AudioContextが48 kHzではありません (${actualSampleRate} Hz)。`,
     );
   }
-  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=2');
+  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=3');
   playerNode = new AudioWorkletNode(audioContext, 'mrt2-pcm-player', {
     numberOfInputs: 0,
     numberOfOutputs: 1,
@@ -356,7 +565,7 @@ async function destroyAudioPlayer() {
 function handleControlMessage(message) {
   switch (message.type) {
     case 'hello':
-      if (message.protocol_version < 2) {
+      if (message.protocol_version < 3) {
         throw new Error('サーバーのWebSocketプロトコルが古いバージョンです。');
       }
       elements.model.textContent = message.model;
@@ -377,6 +586,8 @@ function handleControlMessage(message) {
       });
       bankDirty = false;
       setControls(true);
+      sendMidiConfig();
+      for (const pitch of activeMidiNotes) sendMidiNote(pitch, true);
       elements.revision.textContent = message.prompt_revision;
       elements.promptHint.textContent =
         '重み変更は即時反映されます。テキスト変更のみ再エンコードが必要です。';
@@ -407,6 +618,9 @@ function handleControlMessage(message) {
         `プロンプトバンクを適用しました (${message.encoding_ms.toFixed(1)} ms)。`,
         'live',
       );
+      break;
+    case 'midi_config_applied':
+      updateMidiUi();
       break;
     case 'metrics':
       elements.generationMs.textContent =
@@ -463,6 +677,7 @@ async function start() {
     socket.onerror = () => setStatus('WebSocket通信に失敗しました。', 'error');
     socket.onclose = async () => {
       socket = null;
+      allNotesOff();
       await destroyAudioPlayer();
       setControls(false);
       if (stopping) {
@@ -499,6 +714,7 @@ function applyPrompts() {
 
 function stop() {
   stopping = true;
+  allNotesOff();
   if (weightTimer !== null) {
     clearTimeout(weightTimer);
     weightTimer = null;
@@ -540,7 +756,45 @@ elements.listener.addEventListener('pointerdown', (event) => {
 elements.surface.addEventListener('pointermove', updateSurfaceDrag);
 elements.surface.addEventListener('pointerup', endSurfaceDrag);
 elements.surface.addEventListener('pointercancel', endSurfaceDrag);
+elements.midiEnable.addEventListener('click', enableWebMidi);
+elements.midiInput.addEventListener('change', () => {
+  const input = midiAccess?.inputs.get(elements.midiInput.value) ?? null;
+  attachMidiInput(input);
+});
+elements.computerKeyboard.addEventListener('change', () => {
+  allNotesOff();
+  sendMidiConfig();
+  updateMidiUi();
+});
+elements.autoStrum.addEventListener('change', sendMidiConfig);
+elements.midiSolo.addEventListener('change', sendMidiConfig);
+elements.midiPanic.addEventListener('click', allNotesOff);
+elements.octaveDown.addEventListener('click', () => {
+  keyboardBaseNote = Math.max(24, keyboardBaseNote - 12);
+  updateMidiUi();
+});
+elements.octaveUp.addEventListener('click', () => {
+  keyboardBaseNote = Math.min(84, keyboardBaseNote + 12);
+  updateMidiUi();
+});
+window.addEventListener('keydown', computerKeyDown);
+window.addEventListener('keyup', computerKeyUp);
+window.addEventListener('blur', () => {
+  for (const pitch of pressedComputerKeys.values()) midiNoteOff(pitch);
+  pressedComputerKeys.clear();
+});
+if ('ResizeObserver' in window) {
+  const surfaceResizeObserver = new ResizeObserver(() => {
+    if (mixMode !== 'surface' || elements.surfaceWrap.hidden) return;
+    const weights = calculateSurfaceWeights();
+    prompts.forEach((prompt, index) => { prompt.weight = weights[index]; });
+    updateWeightDisplays();
+    scheduleWeightUpdate();
+  });
+  surfaceResizeObserver.observe(elements.surface);
+}
 
 renderPrompts();
 setMixMode('list');
 setControls(false);
+updateMidiUi();

@@ -35,6 +35,7 @@ from magenta_rt.realtime_server import FRAME_RATE
 from magenta_rt.realtime_server import FRAME_SAMPLES
 from magenta_rt.realtime_server import JaxRealtimeProducer
 from magenta_rt.realtime_server import MAX_PROMPTS
+from magenta_rt.realtime_server import MidiConditioning
 from magenta_rt.realtime_server import PromptDefinition
 from magenta_rt.realtime_server import PromptMixer
 from magenta_rt.realtime_server import prompt_definitions_to_json
@@ -169,7 +170,7 @@ async def _run_stream(
     await send_json(
         {
             "type": "hello",
-            "protocol_version": 2,
+            "protocol_version": 3,
             "model": model_name,
             "sample_rate": SAMPLE_RATE,
             "channels": CHANNELS,
@@ -204,11 +205,13 @@ async def _run_stream(
         embedding_cache=embedding_cache,
     )
     prompt = PromptMixer(initial_definitions, initial_embeddings)
+    midi = MidiConditioning()
     ring_buffer = StereoRingBuffer(buffer_frames * FRAME_SAMPLES)
     producer = JaxRealtimeProducer(
         mrt=mrt,
         prompt=prompt,
         ring_buffer=ring_buffer,
+        midi=midi,
         logger=LOGGER,
     )
     producer.start()
@@ -229,6 +232,11 @@ async def _run_stream(
             "prompt_revision": 0,
             "browser_buffer_frames": 3,
             "browser_max_buffer_frames": 6,
+            "midi": {
+                "enabled": False,
+                "auto_strum": True,
+                "unmask_width": 4,
+            },
         }
     )
     LOGGER.info(
@@ -244,6 +252,7 @@ async def _run_stream(
             send_json=send_json,
             ring_buffer=ring_buffer,
             producer=producer,
+            midi=midi,
         ),
         name="mrt2-websocket-audio-sender",
     )
@@ -254,6 +263,7 @@ async def _run_stream(
             mrt=mrt,
             prompt=prompt,
             embedding_cache=embedding_cache,
+            midi=midi,
         ),
         name="mrt2-websocket-control-receiver",
     )
@@ -289,7 +299,7 @@ async def _run_stream(
 
 
 async def _send_audio(
-    *, websocket, send_lock, send_json, ring_buffer, producer
+    *, websocket, send_lock, send_json, ring_buffer, producer, midi
 ) -> None:
   sequence = 0
   underrun_frames = 0
@@ -331,6 +341,7 @@ async def _send_audio(
     next_deadline += FRAME_DURATION_SECONDS
     if sequence % FRAME_RATE == 0:
       stats = producer.stats()
+      midi_stats = midi.snapshot()
       await send_json(
           {
               "type": "metrics",
@@ -347,6 +358,9 @@ async def _send_audio(
               "generation_ms_max": stats.max_generation_ms,
               "generation_deadline_misses": stats.deadline_misses,
               "prompt_revision": stats.prompt_revision,
+              "midi_enabled": midi_stats.enabled,
+              "midi_active_notes": list(midi_stats.active_notes),
+              "midi_revision": midi_stats.revision,
           }
       )
 
@@ -393,13 +407,54 @@ async def _encode_definitions(
 
 
 async def _receive_controls(
-    *, websocket, send_json, mrt, prompt, embedding_cache
+    *, websocket, send_json, mrt, prompt, embedding_cache, midi
 ) -> None:
   while True:
     message = await websocket.receive_json()
     message_type = message.get("type")
     if message_type == "stop":
       return
+
+    if message_type == "midi_config":
+      try:
+        midi_snapshot = midi.configure(
+            enabled=message.get("enabled"),
+            auto_strum=message.get("auto_strum"),
+            unmask_width=message.get("unmask_width"),
+        )
+      except ValueError as exc:
+        await send_json(
+            {"type": "control_error", "message": str(exc)}
+        )
+        continue
+      await send_json(
+          {
+              "type": "midi_config_applied",
+              "enabled": midi_snapshot.enabled,
+              "auto_strum": midi_snapshot.auto_strum,
+              "unmask_width": midi_snapshot.unmask_width,
+          }
+      )
+      continue
+
+    if message_type == "midi_note":
+      try:
+        note_on = message.get("on")
+        if not isinstance(note_on, bool):
+          raise ValueError("MIDI note on must be a boolean")
+        if note_on:
+          midi.note_on(message.get("pitch"))
+        else:
+          midi.note_off(message.get("pitch"))
+      except ValueError as exc:
+        await send_json(
+            {"type": "control_error", "message": str(exc)}
+        )
+      continue
+
+    if message_type == "midi_all_notes_off":
+      midi.all_notes_off()
+      continue
 
     if message_type == "set_weights":
       try:

@@ -37,6 +37,12 @@ FRAME_SAMPLES = SAMPLE_RATE // FRAME_RATE
 FRAME_DURATION_SECONDS = 1.0 / FRAME_RATE
 FRAME_DURATION_MS = 1000.0 * FRAME_DURATION_SECONDS
 MAX_PROMPTS = 6
+MIDI_PITCHES = 128
+
+_MIDI_IDLE = 0
+_MIDI_ONSET = 1
+_MIDI_SUSTAIN = 2
+_MIDI_ONSET_RELEASED = 3
 
 
 @dataclass(frozen=True)
@@ -147,6 +153,134 @@ class PromptMixer:
       )
       return self._snapshot
 
+
+@dataclass(frozen=True)
+class MidiSnapshot:
+  """Current browser-MIDI configuration and held notes."""
+
+  enabled: bool
+  auto_strum: bool
+  unmask_width: int
+  active_notes: tuple[int, ...]
+  revision: int
+
+
+class MidiConditioning:
+  """Latch browser MIDI events and emit one 128-token JAX frame."""
+
+  def __init__(
+      self,
+      *,
+      enabled: bool = False,
+      auto_strum: bool = True,
+      unmask_width: int = 4,
+  ):
+    self._states = [_MIDI_IDLE] * MIDI_PITCHES
+    self._enabled = bool(enabled)
+    self._auto_strum = bool(auto_strum)
+    self._unmask_width = _validate_unmask_width(unmask_width)
+    self._revision = 0
+    self._lock = threading.Lock()
+
+  def configure(
+      self,
+      *,
+      enabled: object,
+      auto_strum: object,
+      unmask_width: object,
+  ) -> MidiSnapshot:
+    if not isinstance(enabled, bool):
+      raise ValueError("MIDI enabled must be a boolean")
+    if not isinstance(auto_strum, bool):
+      raise ValueError("MIDI auto_strum must be a boolean")
+    width = _validate_unmask_width(unmask_width)
+    with self._lock:
+      self._enabled = enabled
+      self._auto_strum = auto_strum
+      self._unmask_width = width
+      if not enabled:
+        self._states = [_MIDI_IDLE] * MIDI_PITCHES
+      self._revision += 1
+      return self._snapshot_locked()
+
+  def note_on(self, pitch: object) -> None:
+    pitch = _validate_midi_pitch(pitch)
+    with self._lock:
+      if self._enabled:
+        self._states[pitch] = _MIDI_ONSET
+        self._revision += 1
+
+  def note_off(self, pitch: object) -> None:
+    pitch = _validate_midi_pitch(pitch)
+    with self._lock:
+      if not self._enabled:
+        return
+      state = self._states[pitch]
+      if state == _MIDI_ONSET:
+        self._states[pitch] = _MIDI_ONSET_RELEASED
+      elif state == _MIDI_SUSTAIN:
+        self._states[pitch] = _MIDI_IDLE
+      self._revision += 1
+
+  def all_notes_off(self) -> None:
+    with self._lock:
+      self._states = [_MIDI_IDLE] * MIDI_PITCHES
+      self._revision += 1
+
+  def snapshot(self) -> MidiSnapshot:
+    with self._lock:
+      return self._snapshot_locked()
+
+  def frame_tokens(self) -> list[int] | None:
+    """Advance onset latches exactly once and return model note tokens."""
+    with self._lock:
+      if not self._enabled:
+        return None
+
+      observed = tuple(self._states)
+      for pitch, state in enumerate(observed):
+        if state == _MIDI_ONSET:
+          self._states[pitch] = _MIDI_SUSTAIN
+        elif state == _MIDI_ONSET_RELEASED:
+          self._states[pitch] = _MIDI_IDLE
+
+      active = [
+          pitch for pitch, state in enumerate(observed) if state != _MIDI_IDLE
+      ]
+      if self._unmask_width >= MIDI_PITCHES - 1:
+        tokens = [0] * MIDI_PITCHES
+      else:
+        tokens = [-1] * MIDI_PITCHES
+        for pitch in active:
+          start = max(0, pitch - self._unmask_width)
+          end = min(MIDI_PITCHES, pitch + self._unmask_width + 1)
+          tokens[start:end] = [0] * (end - start)
+
+      for pitch in active:
+        state = observed[pitch]
+        if self._auto_strum:
+          tokens[pitch] = 3
+        else:
+          tokens[pitch] = (
+              2
+              if state in (_MIDI_ONSET, _MIDI_ONSET_RELEASED)
+              else 1
+          )
+      return tokens
+
+  def _snapshot_locked(self) -> MidiSnapshot:
+    return MidiSnapshot(
+        enabled=self._enabled,
+        auto_strum=self._auto_strum,
+        unmask_width=self._unmask_width,
+        active_notes=tuple(
+            pitch
+            for pitch, state in enumerate(self._states)
+            if state != _MIDI_IDLE
+        ),
+        revision=self._revision,
+    )
+
 @dataclass(frozen=True)
 class ProducerStats:
   """A consistent snapshot of inference-thread timing counters."""
@@ -168,12 +302,14 @@ class JaxRealtimeProducer(threading.Thread):
       mrt,
       prompt: PromptConditioning | PromptMixer,
       ring_buffer: StereoRingBuffer,
+      midi: MidiConditioning | None = None,
       logger: logging.Logger | None = None,
   ):
     super().__init__(name="mrt2-jax-web-producer", daemon=True)
     self._mrt = mrt
     self._prompt = prompt
     self._ring_buffer = ring_buffer
+    self._midi = midi
     self._logger = logger or logging.getLogger(__name__)
     self._stop_event = threading.Event()
     self._stats_lock = threading.Lock()
@@ -212,11 +348,16 @@ class JaxRealtimeProducer(threading.Thread):
       while not self._stop_event.is_set():
         prompt = self._prompt.get()
         step_start = time.perf_counter()
-        waveform, state = self._mrt.generate(
-            style=prompt.style,
-            frames=1,
-            state=state,
-        )
+        generate_kwargs = {
+            "style": prompt.style,
+            "frames": 1,
+            "state": state,
+        }
+        if self._midi is not None:
+          notes = self._midi.frame_tokens()
+          if notes is not None:
+            generate_kwargs["notes"] = notes
+        waveform, state = self._mrt.generate(**generate_kwargs)
         generation_ms = (time.perf_counter() - step_start) * 1000.0
         samples = validate_audio_frame(waveform)
 
@@ -359,6 +500,24 @@ def _validate_weight(value: object, name: str) -> float:
   if not math.isfinite(weight) or not 0.0 <= weight <= 1.0:
     raise ValueError(f"{name} must be within [0, 1]")
   return weight
+
+
+def _validate_midi_pitch(value: object) -> int:
+  if isinstance(value, bool) or not isinstance(value, int):
+    raise ValueError("MIDI pitch must be an integer")
+  if not 0 <= value < MIDI_PITCHES:
+    raise ValueError(f"MIDI pitch must be within [0, {MIDI_PITCHES - 1}]")
+  return value
+
+
+def _validate_unmask_width(value: object) -> int:
+  if isinstance(value, bool) or not isinstance(value, int):
+    raise ValueError("MIDI unmask_width must be an integer")
+  if not 0 <= value < MIDI_PITCHES:
+    raise ValueError(
+        f"MIDI unmask_width must be within [0, {MIDI_PITCHES - 1}]"
+    )
+  return value
 
 
 def _validate_embeddings(definitions, embeddings) -> list[np.ndarray]:
