@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import logging
 from pathlib import Path
+import secrets
 import time
 
 from magenta_rt.live_compat import APPLE_LIVE_MUSICCOCA_MASKED_TAIL_LEVELS
@@ -38,14 +39,20 @@ from magenta_rt.realtime_server import FRAME_SAMPLES
 from magenta_rt.realtime_server import JaxRealtimeProducer
 from magenta_rt.realtime_server import MAX_PROMPTS
 from magenta_rt.realtime_server import MidiConditioning
+from magenta_rt.realtime_server import PerformanceConditioning
 from magenta_rt.realtime_server import PromptDefinition
-from magenta_rt.realtime_server import PromptMixer
 from magenta_rt.realtime_server import prompt_definitions_to_json
 from magenta_rt.realtime_server import SAMPLE_RATE
 from magenta_rt.realtime_server import SamplingConditioning
 from magenta_rt.realtime_server import validate_prompt
 from magenta_rt.realtime_server import validate_prompt_definitions
 from magenta_rt.realtime_server import WavRecorder
+from magenta_rt.realtime_server import apply_solo_gate
+from magenta_rt.style_encoding import StyleEncoder
+from magenta_rt.prompt_updates import PromptUpdates
+from magenta_rt.visual_conditioning import VisualConditioning, normalize_ratio
+from magenta_rt.visual_session import VisualSession
+from magenta_rt.vlm import DEFAULT_MODEL, MODELS, MAX_IMAGE_BYTES
 
 
 LOGGER = logging.getLogger("jax_realtime_web")
@@ -86,6 +93,7 @@ def make_parser() -> argparse.ArgumentParser:
   )
   parser.add_argument("--host", default="127.0.0.1")
   parser.add_argument("--port", type=int, default=8000)
+  parser.add_argument("--ollama-host", default="http://127.0.0.1:21434")
   return parser
 
 
@@ -105,10 +113,12 @@ def create_app(
     buffer_frames: int,
     prime_frames: int,
     apple_live_parity: bool = False,
+    ollama_host: str = "http://127.0.0.1:21434",
 ):
   """Create a FastAPI app around an already compiled MRT2 system."""
   from fastapi import FastAPI  # pylint: disable=import-outside-toplevel
   from fastapi import WebSocket  # pylint: disable=import-outside-toplevel
+  from fastapi import Request, HTTPException
   from fastapi import (  # pylint: disable=import-outside-toplevel
       WebSocketDisconnect,
   )
@@ -122,9 +132,38 @@ def create_app(
   if not WEB_ROOT.is_dir():
     raise RuntimeError(f"web client directory not found: {WEB_ROOT}")
 
-  app = FastAPI(title="MRT2 Linux Real-time", version="0.1.0")
+  encoder = StyleEncoder(mrt)
+  sessions = {}
+  inference_lock = asyncio.Lock()
+
+  @contextlib.asynccontextmanager
+  async def lifespan(app):
+    try:
+      yield
+    finally:
+      for session in tuple(sessions.values()):
+        await session.close()
+      encoder.close()
+
+  app = FastAPI(title="MRT2 Linux Real-time", version="0.2.0", lifespan=lifespan)
   app.mount("/static", StaticFiles(directory=WEB_ROOT), name="static")
   stream_lock = asyncio.Lock()
+
+  @app.post("/api/visual/frame/{token}", status_code=202)
+  async def visual_frame(token: str, generation: int, sequence: int, request: Request):
+    session = sessions.get(token)
+    if session is None or session.closed:
+      raise HTTPException(409, "audio session is not ready")
+    data = bytearray()
+    async for chunk in request.stream():
+      if len(data) + len(chunk) > MAX_IMAGE_BYTES:
+        raise HTTPException(413, "image exceeds 8 MiB")
+      data.extend(chunk)
+    try:
+      session.submit(bytes(data), generation, sequence)
+    except ValueError as exc:
+      raise HTTPException(409, str(exc)) from exc
+    return {"accepted": True, "generation": generation, "sequence": sequence}
 
   @app.get("/")
   async def index():
@@ -173,6 +212,10 @@ def create_app(
           prime_frames=prime_frames,
           apple_live_parity=apple_live_parity,
           disconnect_type=WebSocketDisconnect,
+          encoder=encoder,
+          visual_sessions=sessions,
+          inference_lock=inference_lock,
+          ollama_host=ollama_host,
       )
 
   return app
@@ -187,14 +230,27 @@ async def _run_stream(
     prime_frames: int,
     apple_live_parity: bool,
     disconnect_type,
+    encoder=None,
+    visual_sessions=None,
+    inference_lock=None,
+    ollama_host="http://127.0.0.1:21434",
 ) -> None:
   ring_buffer = None
   producer = None
+  visual = None
+  updates = None
+  tasks = []
+  token = secrets.token_urlsafe(24)
+  own_encoder = encoder is None
+  encoder = encoder or StyleEncoder(mrt)
   sampling = SamplingConditioning(
       temperature=getattr(mrt, "temperature", 1.1),
       top_k=getattr(mrt, "top_k", 50),
   )
   recorder = WavRecorder("outputs")
+  performance = PerformanceConditioning(
+      base_cfg_notes=getattr(mrt, "cfg_notes", 2.4)
+  )
   send_lock = asyncio.Lock()
 
   async def send_json(message: dict) -> None:
@@ -205,7 +261,10 @@ async def _run_stream(
     await send_json(
         {
             "type": "hello",
-            "protocol_version": 5,
+            "protocol_version": 6,
+            "visual_session": token,
+            "visual_models": {key: value[1] for key, value in MODELS.items()},
+            "visual_default_model": DEFAULT_MODEL,
             "model": model_name,
             "sample_rate": SAMPLE_RATE,
             "channels": CHANNELS,
@@ -236,7 +295,13 @@ async def _run_stream(
     )
     if start_message.get("type") != "start":
       raise ValueError("the first client message must have type 'start'")
-    initial_definitions = _definitions_from_message(start_message)
+    initial_visual = start_message.get("visual") or {}
+    if not isinstance(initial_visual, dict):
+      raise ValueError("visual settings must be an object")
+    initial_ratio = normalize_ratio(initial_visual.get("ratio", 2))
+    initial_definitions = _definitions_from_message(
+        start_message, allow_zero=initial_ratio == 0
+    )
     initial_sampling = start_message.get("sampling")
     if initial_sampling is not None:
       if not isinstance(initial_sampling, dict):
@@ -250,6 +315,9 @@ async def _run_stream(
       raise ValueError("recording must be a boolean")
     if initial_recording:
       recorder.start()
+    performance.configure(
+        mode=start_message.get("performance_mode", "jam")
+    )
 
     await send_json(
         {
@@ -261,13 +329,20 @@ async def _run_stream(
         }
     )
     embedding_cache = {}
-    initial_embeddings = await _encode_definitions(
-        mrt=mrt,
-        definitions=initial_definitions,
-        embedding_cache=embedding_cache,
+    initial_embeddings = await encoder.encode([d.text for d in initial_definitions])
+    prompt = VisualConditioning(initial_definitions, initial_embeddings, ratio=initial_ratio)
+    updates = PromptUpdates(prompt, encoder, send_json)
+    visual = VisualSession(prompt, encoder, send_json, host=ollama_host,
+                           inference_lock=inference_lock or asyncio.Lock())
+    visual.set_performance(performance.snapshot().mode == "solo")
+    if visual_sessions is not None:
+      visual_sessions[token] = visual
+    if start_message.get("visual") is not None:
+      await visual.configure(start_message["visual"])
+      visual.restore(start_message.get("visual_tags"))
+    midi = MidiConditioning(
+        unmask_width=(127 if performance.snapshot().mode == "solo" else 0)
     )
-    prompt = PromptMixer(initial_definitions, initial_embeddings)
-    midi = MidiConditioning()
     drums = DrumConditioning()
     ring_buffer = StereoRingBuffer(buffer_frames * FRAME_SAMPLES)
     producer = JaxRealtimeProducer(
@@ -277,6 +352,7 @@ async def _run_stream(
         midi=midi,
         drums=drums,
         sampling=sampling,
+        performance=performance,
         logger=LOGGER,
     )
     producer.start()
@@ -293,14 +369,16 @@ async def _run_stream(
     await send_json(
         {
             "type": "stream_started",
-            "prompts": prompt_definitions_to_json(initial_definitions),
-            "prompt_revision": 0,
+            "prompts": prompt_definitions_to_json(
+                initial_definitions, allow_zero=prompt.allow_zero_weights
+            ),
+            "prompt_revision": prompt.get().revision,
             "browser_buffer_frames": 3,
             "browser_max_buffer_frames": 6,
             "midi": {
                 "enabled": False,
                 "auto_strum": True,
-                "unmask_width": 4,
+                "unmask_width": midi.snapshot().unmask_width,
             },
             "drums": {"no_drums": False},
             "sampling": {
@@ -312,6 +390,7 @@ async def _run_stream(
                 "path": recorder.snapshot().path,
                 "duration_seconds": recorder.snapshot().duration_seconds,
             },
+            "performance_mode": performance.snapshot().mode,
         }
     )
     LOGGER.info(
@@ -331,6 +410,7 @@ async def _run_stream(
             drums=drums,
             sampling=sampling,
             recorder=recorder,
+            performance=performance,
         ),
         name="mrt2-websocket-audio-sender",
     )
@@ -341,13 +421,17 @@ async def _run_stream(
             mrt=mrt,
             prompt=prompt,
             embedding_cache=embedding_cache,
+            visual=visual,
+            updates=updates,
             midi=midi,
             drums=drums,
             sampling=sampling,
             recorder=recorder,
+            performance=performance,
         ),
         name="mrt2-websocket-control-receiver",
     )
+    tasks = [sender, receiver]
     done, pending = await asyncio.wait(
         {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
     )
@@ -367,6 +451,19 @@ async def _run_stream(
           {"type": "error", "code": "stream_failed", "message": str(exc)}
       )
   finally:
+    for task in tasks:
+      if not task.done():
+        task.cancel()
+    if tasks:
+      await asyncio.gather(*tasks, return_exceptions=True)
+    if visual_sessions is not None:
+      visual_sessions.pop(token, None)
+    if updates is not None:
+      await updates.close()
+    if visual is not None:
+      await visual.close()
+    if own_encoder:
+      encoder.close()
     if producer is not None:
       producer.stop()
       await asyncio.to_thread(producer.join, 5.0)
@@ -389,7 +486,7 @@ async def _run_stream(
 
 async def _send_audio(
     *, websocket, send_lock, send_json, ring_buffer, producer, midi, drums,
-    sampling, recorder
+    sampling, recorder, performance
 ) -> None:
   sequence = 0
   underrun_frames = 0
@@ -398,6 +495,7 @@ async def _send_audio(
   recovery_wait_ms_total = 0.0
   loop = asyncio.get_running_loop()
   next_deadline = loop.time()
+  solo_gate = 1.0
 
   while True:
     sleep_seconds = next_deadline - loop.time()
@@ -421,6 +519,14 @@ async def _send_audio(
 
     samples, missing = ring_buffer.read(
         FRAME_SAMPLES, zero_pad=True, timeout=0.0
+    )
+    performance_stats = performance.snapshot()
+    midi_now = midi.snapshot()
+    samples, solo_gate = apply_solo_gate(
+        samples,
+        gate=solo_gate,
+        note_held=bool(midi_now.active_notes),
+        solo=performance_stats.mode == "solo",
     )
     recorder.write(samples)
     underrun_frames += int(missing > 0)
@@ -462,6 +568,8 @@ async def _send_audio(
               "sampling_revision": sampling_stats.revision,
               "recording_active": recording_stats.active,
               "recording_duration_seconds": recording_stats.duration_seconds,
+              "performance_mode": performance_stats.mode,
+              "solo_gate": solo_gate,
           }
       )
 
@@ -471,10 +579,10 @@ async def _send_audio(
       next_deadline = now
 
 
-def _definitions_from_message(message) -> tuple[PromptDefinition, ...]:
+def _definitions_from_message(message, *, allow_zero=False) -> tuple[PromptDefinition, ...]:
   """Read protocol-v2 prompts, retaining protocol-v1 compatibility."""
   if "prompts" in message:
-    return validate_prompt_definitions(message.get("prompts"))
+    return validate_prompt_definitions(message.get("prompts"), allow_zero=allow_zero)
   text = validate_prompt(message.get("prompt"))
   return (PromptDefinition(prompt_id=0, text=text, weight=1.0),)
 
@@ -509,11 +617,18 @@ async def _encode_definitions(
 
 async def _receive_controls(
     *, websocket, send_json, mrt, prompt, embedding_cache, midi, drums,
-    sampling, recorder
+    sampling, recorder, performance, visual=None, updates=None
 ) -> None:
   while True:
     message = await websocket.receive_json()
     message_type = message.get("type")
+    if message_type == "visual_config" and visual is not None:
+      try:
+        await visual.configure(message)
+      except (ValueError, TypeError) as exc:
+        await send_json({"type": "visual_error", "generation": message.get("generation"),
+                         "message": str(exc)})
+      continue
     if message_type == "stop":
       recording = recorder.stop()
       if recording.path is not None:
@@ -554,6 +669,39 @@ async def _receive_controls(
             recording.path,
             recording.duration_seconds,
         )
+      continue
+
+    if message_type == "performance_config":
+      try:
+        performance_snapshot = performance.configure(
+            mode=message.get("mode")
+        )
+      except ValueError as exc:
+        await send_json(
+            {"type": "control_error", "message": str(exc)}
+        )
+        continue
+      midi_snapshot = midi.snapshot()
+      if visual is not None:
+        visual.set_performance(performance_snapshot.mode == "solo")
+      midi.configure(
+          enabled=midi_snapshot.enabled,
+          auto_strum=midi_snapshot.auto_strum,
+          unmask_width=(
+              127 if performance_snapshot.mode == "solo" else 0
+          ),
+      )
+      await send_json(
+          {
+              "type": "performance_config_applied",
+              "mode": performance_snapshot.mode,
+              "performance_revision": performance_snapshot.revision,
+          }
+      )
+      LOGGER.info(
+          "Performance mode switched to %s without resetting streaming state",
+          performance_snapshot.mode.upper(),
+      )
       continue
 
     if message_type == "midi_config":
@@ -649,6 +797,8 @@ async def _receive_controls(
     if message_type == "set_weights":
       try:
         prompt.update_weights(message.get("weights"))
+        if updates is not None:
+          updates.weight_version += 1
       except ValueError as exc:
         await send_json(
             {
@@ -669,7 +819,9 @@ async def _receive_controls(
       continue
 
     try:
-      definitions = _definitions_from_message(message)
+      definitions = _definitions_from_message(
+          message, allow_zero=getattr(prompt, "allow_zero_weights", False)
+      )
     except ValueError as exc:
       await send_json(
           {
@@ -680,10 +832,15 @@ async def _receive_controls(
       )
       continue
     request_id = message.get("request_id")
+    if updates is not None:
+      updates.submit(definitions, request_id)
+      continue
     await send_json(
         {
             "type": "prompt_encoding",
-            "prompts": prompt_definitions_to_json(definitions),
+            "prompts": prompt_definitions_to_json(
+                definitions, allow_zero=getattr(prompt, "allow_zero_weights", False)
+            ),
             "uncached_count": len(
                 {
                     definition.text
@@ -706,7 +863,9 @@ async def _receive_controls(
     await send_json(
         {
             "type": "prompt_applied",
-            "prompts": prompt_definitions_to_json(definitions),
+            "prompts": prompt_definitions_to_json(
+                definitions, allow_zero=getattr(prompt, "allow_zero_weights", False)
+            ),
             "prompt_revision": snapshot.revision,
             "encoding_ms": (time.perf_counter() - started) * 1000.0,
             "request_id": request_id,
@@ -771,6 +930,7 @@ def main() -> None:
       buffer_frames=args.buffer_frames,
       prime_frames=args.prime_frames,
       apple_live_parity=args.apple_live_parity,
+      ollama_host=args.ollama_host,
   )
   LOGGER.info(
       "Open http://%s:%d after creating an SSH tunnel",

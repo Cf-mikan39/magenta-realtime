@@ -3,6 +3,8 @@
 
 "use strict";
 
+import { sharedCamera } from './media-source.js?v=12';
+
 const MEDIAPIPE_VERSION = "0.10.35";
 const MEDIAPIPE_ROOT =
   `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}`;
@@ -160,10 +162,13 @@ export class HandPromptController {
     this.lastDetectionMs = -Infinity;
     this.lastVideoTime = -1;
     this.smoothedPinch = new Map();
+    this.sourceVersion = 0;
+    this.lease = null;
   }
 
   async start() {
     if (this.active) return;
+    const version = ++this.sourceVersion;
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error(
         "カメラAPIを利用できません。SSHトンネル経由の127.0.0.1をChromeで開いてください。",
@@ -171,18 +176,16 @@ export class HandPromptController {
     }
     this.onStatus("loading", "MediaPipe Gesture Recognizerを読み込んでいます…");
     if (!this.recognizer) this.recognizer = await this.#createRecognizer();
+    if (version !== this.sourceVersion) return;
 
     this.onStatus("loading", "カメラの許可を待っています…");
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: "user",
-        width: { ideal: 640 },
-        height: { ideal: 480 },
-      },
-      audio: false,
-    });
+    const lease = await sharedCamera.acquire();
+    if (version !== this.sourceVersion) { lease.release(); return; }
+    this.lease = lease;
+    this.stream = lease.stream;
     this.video.srcObject = this.stream;
     await this.video.play();
+    if (version !== this.sourceVersion) return;
     this.canvas.width = this.video.videoWidth || 640;
     this.canvas.height = this.video.videoHeight || 480;
     this.active = true;
@@ -194,13 +197,15 @@ export class HandPromptController {
   }
 
   stop(notify = true) {
+    this.sourceVersion += 1;
     this.active = false;
     if (this.animationFrame !== null) {
       cancelAnimationFrame(this.animationFrame);
       this.animationFrame = null;
     }
     if (this.stream) {
-      for (const track of this.stream.getTracks()) track.stop();
+      this.lease?.release();
+      this.lease = null;
       this.stream = null;
     }
     this.video.pause();

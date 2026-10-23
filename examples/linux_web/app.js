@@ -2,15 +2,17 @@ import {
   canonicalHandedness,
   HandPromptController,
   hybridPromptWeights,
-} from './hand-control.js?v=10';
+} from './hand-control.js?v=12';
+import { VisualInput, normalWeightsValid } from './visual-input.js?v=15';
 import {
   lfoValue,
   mapModulationRange,
   midiCcValue,
-} from './modulation.js?v=10';
+} from './modulation.js?v=11';
 
 const COLORS = ['#9b8cff', '#4ed6b2', '#ffb95e', '#ff7891', '#64b5ff', '#d98cff'];
-const MAX_PROMPTS = 6;
+const MAX_PROMPTS = 32;
+const SOLO_INACTIVITY_TIMEOUT_MS = 30_000;
 const WEIGHT_SEND_INTERVAL_MS = 40;
 const MODULATION_INTERVAL_MS = 40;
 const SAMPLING_SEND_INTERVAL_MS = 40;
@@ -61,7 +63,9 @@ const elements = {
   midiInput: document.querySelector('#midi-input'),
   computerKeyboard: document.querySelector('#computer-keyboard'),
   autoStrum: document.querySelector('#auto-strum'),
-  midiSolo: document.querySelector('#midi-solo'),
+  jamMode: document.querySelector('#jam-mode'),
+  soloMode: document.querySelector('#solo-mode'),
+  performanceModeHint: document.querySelector('#performance-mode-hint'),
   noDrums: document.querySelector('#no-drums'),
   temperature: document.querySelector('#temperature'),
   temperatureValue: document.querySelector('#temperature-value'),
@@ -125,6 +129,8 @@ let nextPromptId = 2;
 let listenerPosition = { x: 0.5, y: 0.5 };
 let mixMode = 'list';
 let bankDirty = false;
+let bankEditVersion = 0;
+let applyingEditVersion = null;
 let socket = null;
 let audioContext = null;
 let playerNode = null;
@@ -137,6 +143,8 @@ let recordingActive = false;
 let recordingRequestPending = false;
 let recordingPath = null;
 let recordingDurationSeconds = 0;
+let performanceMode = 'jam';
+let soloInactivityTimer = null;
 let weightTimer = null;
 let samplingTimer = null;
 let surfaceDrag = null;
@@ -161,6 +169,24 @@ const gestureSelects = {
   fox: elements.gestureFox,
   closed_fist: elements.gestureClosedFist,
 };
+const visualInput = new VisualInput((message) => {
+  if (socket?.readyState !== WebSocket.OPEN) return false;
+  socket.send(JSON.stringify(message));
+  return true;
+}, {
+  normalHasWeight: () => normalWeightsValid(prompts, 1),
+  beforeNormalRatio: () => {
+    // Flush a newly raised slider before the ratio message, rather than waiting
+    // for its 40 ms timer while the server still sees an all-zero bank.
+    if (!visualInput.ready || bankDirty || socket?.readyState !== WebSocket.OPEN) return;
+    if (weightTimer !== null) {
+      clearTimeout(weightTimer);
+      weightTimer = null;
+    }
+    socket.send(JSON.stringify({ type: 'set_weights', weights: weightPayload() }));
+  },
+});
+
 const handController = new HandPromptController({
   video: elements.handVideo,
   canvas: elements.handCanvas,
@@ -245,6 +271,7 @@ function stopRecording() {
 
 function markBankDirty() {
   bankDirty = true;
+  bankEditVersion += 1;
   setControls(isRunning());
   elements.promptHint.textContent = isRunning()
     ? 'テキストまたは構成が変わりました。「テキスト変更をエンコード」を押してください。'
@@ -260,7 +287,9 @@ function normalizedWeights() {
 function promptPayload() {
   return prompts.map(({ id, text, weight }) => ({
     id,
-    text: text.trim(),
+    text: performanceMode === 'solo'
+      ? `SOLO ${text.trim()}`
+      : text.trim(),
     weight,
   }));
 }
@@ -273,7 +302,7 @@ function validatePrompts() {
   if (prompts.some((prompt) => !prompt.text.trim())) {
     throw new Error('すべてのプロンプトにテキストを入力してください。');
   }
-  if (prompts.every((prompt) => prompt.weight <= 0)) {
+  if (!normalWeightsValid(prompts, visualInput.ratioValue())) {
     throw new Error('少なくとも1個の重みを0より大きくしてください。');
   }
 }
@@ -471,7 +500,7 @@ function setMixMode(mode) {
 
 function scheduleWeightUpdate() {
   if (!isRunning() || bankDirty) return;
-  if (prompts.every((prompt) => prompt.weight <= 0)) {
+  if (!normalWeightsValid(prompts, visualInput.ratioValue())) {
     setStatus('少なくとも1個の重みを0より大きくしてください。', 'error');
     return;
   }
@@ -487,7 +516,7 @@ function applyModulatedWeight(promptId, value) {
   const target = prompts.find((prompt) => prompt.id === promptId);
   if (!target) return;
   target.weight = Math.max(0, Math.min(1, value));
-  if (prompts.every((prompt) => prompt.weight <= 0)) {
+  if (!normalWeightsValid(prompts, visualInput.ratioValue())) {
     const fallback = prompts.find((prompt) => prompt.id !== promptId);
     if (fallback) fallback.weight = 1;
     else target.weight = 0.001;
@@ -1048,8 +1077,44 @@ function sendMidiConfig() {
     type: 'midi_config',
     enabled: midiConditioningEnabled(),
     auto_strum: elements.autoStrum.checked,
-    unmask_width: elements.midiSolo.checked ? 127 : 4,
+    unmask_width: performanceMode === 'solo' ? 127 : 0,
   }));
+}
+
+function sendPerformanceConfig() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({
+    type: 'performance_config',
+    mode: performanceMode,
+  }));
+}
+
+function resetSoloInactivityTimer() {
+  if (soloInactivityTimer !== null) {
+    window.clearTimeout(soloInactivityTimer);
+    soloInactivityTimer = null;
+  }
+  if (performanceMode !== 'solo' || !isRunning()) return;
+  soloInactivityTimer = window.setTimeout(() => {
+    soloInactivityTimer = null;
+    if (performanceMode === 'solo' && isRunning()) stop();
+  }, SOLO_INACTIVITY_TIMEOUT_MS);
+}
+
+function setPerformanceMode(mode, send = true) {
+  if (mode !== 'jam' && mode !== 'solo') return;
+  const changed = performanceMode !== mode;
+  performanceMode = mode;
+  elements.jamMode.classList.toggle('active', mode === 'jam');
+  elements.soloMode.classList.toggle('active', mode === 'solo');
+  elements.performanceModeHint.textContent = mode === 'solo'
+    ? 'Solo: SOLOプロンプト、入力外ノート抑制、2秒リリースゲート。30秒無入力で停止します。'
+    : 'Jam: 入力ノートを中心に、モデルが伴奏や周辺音を追加できます。';
+  resetSoloInactivityTimer();
+  if (!send || !changed || socket?.readyState !== WebSocket.OPEN) return;
+  sendPerformanceConfig();
+  sendMidiConfig();
+  applyPrompts();
 }
 
 function sendDrumConfig() {
@@ -1078,11 +1143,13 @@ function midiNoteOn(pitch) {
   heldMidiNotes.add(pitch);
   activeMidiNotes.add(pitch);
   sendMidiNote(pitch, true);
+  resetSoloInactivityTimer();
   updateMidiUi();
 }
 
 function midiNoteOff(pitch) {
   heldMidiNotes.delete(pitch);
+  resetSoloInactivityTimer();
   if (sustainDown) return;
   if (activeMidiNotes.delete(pitch)) sendMidiNote(pitch, false);
   updateMidiUi();
@@ -1253,7 +1320,7 @@ async function createAudioPlayer() {
       `AudioContextが48 kHzではありません (${actualSampleRate} Hz)。`,
     );
   }
-  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=10');
+  await audioContext.audioWorklet.addModule('/static/audio-worklet.js?v=11');
   playerNode = new AudioWorkletNode(audioContext, 'mrt2-pcm-player', {
     numberOfInputs: 0,
     numberOfOutputs: 1,
@@ -1291,12 +1358,15 @@ async function destroyAudioPlayer() {
 }
 
 function handleControlMessage(message) {
+  if (visualInput.handle(message)) return;
   switch (message.type) {
     case 'hello':
-      if (message.protocol_version < 5) {
+      if (message.protocol_version < 6) {
         throw new Error('サーバーのWebSocketプロトコルが古いバージョンです。');
       }
       elements.model.textContent = message.model;
+      if (!message.visual_session) throw new Error('画像入力に対応したサーバーを起動してください。');
+      visualInput.connected(message.visual_session);
       elements.audioFormat.textContent =
         `${message.sample_rate / 1_000} kHz · stereo · ${message.pcm_format}`;
       if (recordingArmed) {
@@ -1308,6 +1378,8 @@ function handleControlMessage(message) {
         prompts: promptPayload(),
         sampling: samplingPayload(),
         recording: recordingArmed,
+        performance_mode: performanceMode,
+        ...visualInput.startPayload(),
       }));
       setStatus(`${prompts.length}個の初期プロンプトを送信しました。`, 'working');
       break;
@@ -1315,6 +1387,7 @@ function handleControlMessage(message) {
       setStatus(message.message, 'working');
       break;
     case 'stream_started':
+      visualInput.streamStarted();
       playerNode.port.postMessage({
         type: 'configure',
         frameSamples: 1_920,
@@ -1334,6 +1407,8 @@ function handleControlMessage(message) {
       recordingPath = message.recording?.path ?? recordingPath;
       recordingDurationSeconds = message.recording?.duration_seconds ?? 0;
       updateRecordingUi();
+      setPerformanceMode(message.performance_mode ?? performanceMode, false);
+      sendPerformanceConfig();
       sendMidiConfig();
       sendDrumConfig();
       for (const pitch of activeMidiNotes) sendMidiNote(pitch, true);
@@ -1358,6 +1433,12 @@ function handleControlMessage(message) {
       );
       break;
     case 'prompt_applied':
+      if (message.request_id !== requestId) break;
+      if (applyingEditVersion !== bankEditVersion) {
+        setControls(true);
+        elements.revision.textContent = message.prompt_revision;
+        break;
+      }
       bankDirty = false;
       setControls(true);
       elements.revision.textContent = message.prompt_revision;
@@ -1370,6 +1451,9 @@ function handleControlMessage(message) {
       break;
     case 'midi_config_applied':
       updateMidiUi();
+      break;
+    case 'performance_config_applied':
+      setPerformanceMode(message.mode, false);
       break;
     case 'drum_config_applied':
       elements.noDrums.checked = message.no_drums;
@@ -1408,6 +1492,9 @@ function handleControlMessage(message) {
         recordingArmed = true;
         recordingDurationSeconds = message.recording_duration_seconds ?? 0;
         updateRecordingUi();
+      }
+      if (message.performance_mode && message.performance_mode !== performanceMode) {
+        setPerformanceMode(message.performance_mode, false);
       }
       updateUnderruns();
       break;
@@ -1455,6 +1542,7 @@ async function start() {
     };
     socket.onerror = () => setStatus('WebSocket通信に失敗しました。', 'error');
     socket.onclose = async () => {
+      visualInput.disconnected();
       socket = null;
       allNotesOff();
       await destroyAudioPlayer();
@@ -1463,6 +1551,10 @@ async function start() {
       recordingActive = false;
       recordingArmed = false;
       recordingRequestPending = false;
+      if (soloInactivityTimer !== null) {
+        window.clearTimeout(soloInactivityTimer);
+        soloInactivityTimer = null;
+      }
       if (recordingWasActive && !recordingPath) {
         updateRecordingUi('接続終了時にサーバー側でWAVを確定しました');
       } else {
@@ -1492,6 +1584,7 @@ function applyPrompts() {
   }
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   requestId += 1;
+  applyingEditVersion = bankEditVersion;
   elements.apply.disabled = true;
   socket.send(JSON.stringify({
     type: 'set_prompts',
@@ -1502,7 +1595,12 @@ function applyPrompts() {
 
 function stop() {
   stopping = true;
+  visualInput.disconnected();
   allNotesOff();
+  if (soloInactivityTimer !== null) {
+    window.clearTimeout(soloInactivityTimer);
+    soloInactivityTimer = null;
+  }
   if (weightTimer !== null) {
     clearTimeout(weightTimer);
     weightTimer = null;
@@ -1530,13 +1628,14 @@ elements.recordStop.addEventListener('click', stopRecording);
 elements.apply.addEventListener('click', applyPrompts);
 elements.addPrompt.addEventListener('click', () => {
   if (prompts.length >= MAX_PROMPTS) return;
-  const angle = (2 * Math.PI * prompts.length) / MAX_PROMPTS;
+  const angle = prompts.length * Math.PI * (3 - Math.sqrt(5));
+  const radius = 0.28 + 0.055 * (prompts.length % 3);
   prompts.push({
     id: nextPromptId,
     text: '',
     weight: 0.5,
-    x: 0.5 + 0.32 * Math.cos(angle),
-    y: 0.5 + 0.32 * Math.sin(angle),
+    x: 0.5 + radius * Math.cos(angle),
+    y: 0.5 + radius * Math.sin(angle),
   });
   nextPromptId += 1;
   markBankDirty();
@@ -1561,7 +1660,8 @@ elements.computerKeyboard.addEventListener('change', () => {
   updateMidiUi();
 });
 elements.autoStrum.addEventListener('change', sendMidiConfig);
-elements.midiSolo.addEventListener('change', sendMidiConfig);
+elements.jamMode.addEventListener('click', () => setPerformanceMode('jam'));
+elements.soloMode.addEventListener('click', () => setPerformanceMode('solo'));
 elements.noDrums.addEventListener('change', sendDrumConfig);
 elements.temperature.addEventListener('input', scheduleSamplingUpdate);
 elements.topK.addEventListener('input', scheduleSamplingUpdate);
@@ -1634,6 +1734,7 @@ if ('ResizeObserver' in window) {
 renderPrompts();
 setMixMode('list');
 setHandControlMode('pinch');
+setPerformanceMode('jam', false);
 setControls(false);
 updateMidiUi();
 syncLfoControls();

@@ -501,6 +501,17 @@ select {
   margin-top: 14px;
 }
 
+.performance-mode {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #9097a4;
+  font-size: 11px;
+}
+
+.performance-mode .mode-switch { padding: 2px; }
+.performance-mode button.mode { padding: 6px 10px; }
+
 .check-control {
   display: inline-flex;
   align-items: center;
@@ -783,3 +794,21 @@ dd { margin: 5px 0 0; font-size: 13px; font-variant-numeric: tabular-nums; }
   .gesture-map-row { grid-template-columns: 1fr; }
   dl { grid-template-columns: 1fr; }
 }
+/* Visual input stays separate from the editable normal-prompt bank. */
+.visual-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 14px;
+  margin-bottom: 16px;
+}
+.visual-controls label { display: grid; gap: 6px; }
+.visual-controls select, .visual-controls input { width: 100%; }
+.visual-preview img, .visual-preview video {
+  display: block;
+  max-width: 100%;
+  max-height: 260px;
+  margin: 14px 0;
+  border-radius: 12px;
+}
+.visual-preview [hidden] { display: none; }
+.visual-tags { overflow-wrap: anywhere; line-height: 1.7; }

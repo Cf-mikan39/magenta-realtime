@@ -8,6 +8,7 @@ import unittest
 
 from magenta_rt.realtime_server import DrumConditioning
 from magenta_rt.realtime_server import MidiConditioning
+from magenta_rt.realtime_server import PerformanceConditioning
 from magenta_rt.realtime_server import SamplingConditioning
 from magenta_rt.realtime_server import WavRecorder
 from scripts.jax_realtime_web import _receive_controls
@@ -44,6 +45,7 @@ class JaxRealtimeWebProtocolTest(unittest.IsolatedAsyncioTestCase):
         drums=drums,
         sampling=SamplingConditioning(),
         recorder=WavRecorder(),
+        performance=PerformanceConditioning(),
     )
     self.assertTrue(drums.snapshot().no_drums)
     self.assertEqual(sent[0]["type"], "drum_config_applied")
@@ -69,6 +71,7 @@ class JaxRealtimeWebProtocolTest(unittest.IsolatedAsyncioTestCase):
         drums=DrumConditioning(),
         sampling=sampling,
         recorder=WavRecorder(),
+        performance=PerformanceConditioning(),
     )
     self.assertEqual(sampling.snapshot().temperature, 1.75)
     self.assertEqual(sampling.snapshot().top_k, 96)
@@ -96,12 +99,40 @@ class JaxRealtimeWebProtocolTest(unittest.IsolatedAsyncioTestCase):
           drums=DrumConditioning(),
           sampling=SamplingConditioning(),
           recorder=recorder,
+          performance=PerformanceConditioning(),
       )
     self.assertEqual(sent[0]["type"], "recording_config_applied")
     self.assertTrue(sent[0]["active"])
     self.assertEqual(sent[1]["type"], "recording_config_applied")
     self.assertFalse(sent[1]["active"])
     self.assertIsNone(sent[1]["path"])
+
+  async def test_switches_performance_mode_and_midi_mask(self):
+    sent = []
+
+    async def send_json(message):
+      sent.append(message)
+
+    midi = MidiConditioning(enabled=True, unmask_width=0)
+    performance = PerformanceConditioning()
+    await _receive_controls(
+        websocket=_FakeWebSocket([
+            {"type": "performance_config", "mode": "solo"},
+            {"type": "stop"},
+        ]),
+        send_json=send_json,
+        mrt=None,
+        prompt=None,
+        embedding_cache={},
+        midi=midi,
+        drums=DrumConditioning(),
+        sampling=SamplingConditioning(),
+        recorder=WavRecorder(),
+        performance=performance,
+    )
+    self.assertEqual(performance.snapshot().mode, "solo")
+    self.assertEqual(midi.snapshot().unmask_width, 127)
+    self.assertEqual(sent[0]["type"], "performance_config_applied")
 
 
 if __name__ == "__main__":

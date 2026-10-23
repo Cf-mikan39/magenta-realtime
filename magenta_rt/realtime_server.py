@@ -39,8 +39,10 @@ FRAME_RATE = 25
 FRAME_SAMPLES = SAMPLE_RATE // FRAME_RATE
 FRAME_DURATION_SECONDS = 1.0 / FRAME_RATE
 FRAME_DURATION_MS = 1000.0 * FRAME_DURATION_SECONDS
-MAX_PROMPTS = 6
+MAX_PROMPTS = 32
 MIDI_PITCHES = 128
+SOLO_GATE_DECAY_SECONDS = 2.0
+SOLO_RELEASE_CFG_NOTES = 50.0
 
 _MIDI_IDLE = 0
 _MIDI_ONSET = 1
@@ -92,16 +94,18 @@ class PromptDefinition:
 class PromptMixer:
   """Cache prompt embeddings and atomically publish their weighted blend."""
 
-  def __init__(self, definitions, embeddings):
+  def __init__(self, definitions, embeddings, *, allow_zero=False):
+    self._allow_zero = allow_zero
     definitions = tuple(definitions)
     embeddings = tuple(_validate_embeddings(definitions, embeddings))
     style = blend_style_embeddings(
-        embeddings, [definition.weight for definition in definitions]
+        embeddings, [definition.weight for definition in definitions],
+        allow_zero=self._allow_zero,
     )
     self._definitions = definitions
     self._embeddings = embeddings
     self._snapshot = PromptSnapshot(
-        text=_describe_mix(definitions),
+        text=_describe_mix(definitions, allow_zero=self._allow_zero),
         style=style,
         revision=0,
     )
@@ -115,18 +119,28 @@ class PromptMixer:
     with self._lock:
       return self._definitions
 
+  def set_allow_zero(self, allow_zero: bool) -> None:
+    """Only inactive normal conditioning may keep an all-zero bank."""
+    with self._lock:
+      normalize_prompt_weights(
+          [definition.weight for definition in self._definitions],
+          allow_zero=allow_zero,
+      )
+      self._allow_zero = allow_zero
+
   def configure(self, definitions, embeddings) -> PromptSnapshot:
     """Atomically replace prompt slots after their embeddings are ready."""
     definitions = tuple(definitions)
     embeddings = tuple(_validate_embeddings(definitions, embeddings))
     style = blend_style_embeddings(
-        embeddings, [definition.weight for definition in definitions]
+        embeddings, [definition.weight for definition in definitions],
+        allow_zero=self._allow_zero,
     )
     with self._lock:
       self._definitions = definitions
       self._embeddings = embeddings
       self._snapshot = PromptSnapshot(
-          text=_describe_mix(definitions),
+          text=_describe_mix(definitions, allow_zero=self._allow_zero),
           style=style,
           revision=self._snapshot.revision + 1,
       )
@@ -135,7 +149,9 @@ class PromptMixer:
   def update_weights(self, values: object) -> PromptSnapshot:
     """Apply raw 0–1 weights without re-running the text encoder."""
     with self._lock:
-      weights_by_id = validate_weight_update(values, self._definitions)
+      weights_by_id = validate_weight_update(
+          values, self._definitions, allow_zero=self._allow_zero
+      )
       definitions = tuple(
           PromptDefinition(
               prompt_id=definition.prompt_id,
@@ -147,10 +163,11 @@ class PromptMixer:
       style = blend_style_embeddings(
           self._embeddings,
           [definition.weight for definition in definitions],
+          allow_zero=self._allow_zero,
       )
       self._definitions = definitions
       self._snapshot = PromptSnapshot(
-          text=_describe_mix(definitions),
+          text=_describe_mix(definitions, allow_zero=self._allow_zero),
           style=style,
           revision=self._snapshot.revision + 1,
       )
@@ -281,6 +298,45 @@ class MidiConditioning:
             for pitch, state in enumerate(self._states)
             if state != _MIDI_IDLE
         ),
+        revision=self._revision,
+    )
+
+
+@dataclass(frozen=True)
+class PerformanceSnapshot:
+  """Jam-app performance mode shared by generation and audio output."""
+
+  mode: str
+  base_cfg_notes: float
+  revision: int
+
+
+class PerformanceConditioning:
+  """Atomically switch between the official Jam and Solo behaviors."""
+
+  def __init__(self, *, mode: str = "jam", base_cfg_notes: float = 2.4):
+    self._mode = _validate_performance_mode(mode)
+    self._base_cfg_notes = float(base_cfg_notes)
+    if not math.isfinite(self._base_cfg_notes):
+      raise ValueError("base CFG Notes must be finite")
+    self._revision = 0
+    self._lock = threading.Lock()
+
+  def configure(self, *, mode: object) -> PerformanceSnapshot:
+    mode = _validate_performance_mode(mode)
+    with self._lock:
+      self._mode = mode
+      self._revision += 1
+      return self._snapshot_locked()
+
+  def snapshot(self) -> PerformanceSnapshot:
+    with self._lock:
+      return self._snapshot_locked()
+
+  def _snapshot_locked(self) -> PerformanceSnapshot:
+    return PerformanceSnapshot(
+        mode=self._mode,
+        base_cfg_notes=self._base_cfg_notes,
         revision=self._revision,
     )
 
@@ -464,6 +520,7 @@ class JaxRealtimeProducer(threading.Thread):
       midi: MidiConditioning | None = None,
       drums: DrumConditioning | None = None,
       sampling: SamplingConditioning | None = None,
+      performance: PerformanceConditioning | None = None,
       logger: logging.Logger | None = None,
   ):
     super().__init__(name="mrt2-jax-web-producer", daemon=True)
@@ -473,6 +530,7 @@ class JaxRealtimeProducer(threading.Thread):
     self._midi = midi
     self._drums = drums
     self._sampling = sampling
+    self._performance = performance
     self._logger = logger or logging.getLogger(__name__)
     self._stop_event = threading.Event()
     self._stats_lock = threading.Lock()
@@ -482,6 +540,7 @@ class JaxRealtimeProducer(threading.Thread):
     self._latest_generation_ms = 0.0
     self._max_generation_ms = 0.0
     self._prompt_revision = 0
+    self._solo_cfg_notes = None
     self.error: BaseException | None = None
 
   def stop(self) -> None:
@@ -528,6 +587,28 @@ class JaxRealtimeProducer(threading.Thread):
           sampling = self._sampling.snapshot()
           generate_kwargs["temperature"] = sampling.temperature
           generate_kwargs["top_k"] = sampling.top_k
+        if self._performance is not None:
+          performance = self._performance.snapshot()
+          note_held = bool(
+              self._midi is not None
+              and self._midi.snapshot().active_notes
+          )
+          if performance.mode == "solo":
+            if note_held:
+              self._solo_cfg_notes = performance.base_cfg_notes
+            elif self._solo_cfg_notes is None:
+              self._solo_cfg_notes = SOLO_RELEASE_CFG_NOTES
+            else:
+              cfg_step = (
+                  SOLO_RELEASE_CFG_NOTES - performance.base_cfg_notes
+              ) / (SOLO_GATE_DECAY_SECONDS * FRAME_RATE)
+              self._solo_cfg_notes = min(
+                  SOLO_RELEASE_CFG_NOTES,
+                  self._solo_cfg_notes + cfg_step,
+              )
+          else:
+            self._solo_cfg_notes = performance.base_cfg_notes
+          generate_kwargs["cfg_notes"] = self._solo_cfg_notes
         waveform, state = self._mrt.generate(**generate_kwargs)
         generation_ms = (time.perf_counter() - step_start) * 1000.0
         samples = validate_audio_frame(waveform)
@@ -554,6 +635,12 @@ class JaxRealtimeProducer(threading.Thread):
       self._ring_buffer.close()
 
 
+def _validate_performance_mode(value: object) -> str:
+  if value not in ("jam", "solo"):
+    raise ValueError("performance mode must be 'jam' or 'solo'")
+  return value
+
+
 def _validate_temperature(value: object) -> float:
   if isinstance(value, bool) or not isinstance(value, (int, float)):
     raise ValueError("Temperature must be a number")
@@ -571,7 +658,7 @@ def _validate_top_k(value: object) -> int:
   return value
 
 
-def validate_prompt(value: object, *, max_length: int = 500) -> str:
+def validate_prompt(value: object, *, max_length: int = 512) -> str:
   """Validate a prompt received from an untrusted WebSocket client."""
   if not isinstance(value, str):
     raise ValueError("prompt must be a string")
@@ -583,8 +670,8 @@ def validate_prompt(value: object, *, max_length: int = 500) -> str:
   return prompt
 
 
-def validate_prompt_definitions(value: object) -> tuple[PromptDefinition, ...]:
-  """Validate one to six prompt slots from a WebSocket message."""
+def validate_prompt_definitions(value: object, *, allow_zero=False) -> tuple[PromptDefinition, ...]:
+  """Validate one to 32 prompt slots from a WebSocket message."""
   if not isinstance(value, list):
     raise ValueError("prompts must be an array")
   if not 1 <= len(value) <= MAX_PROMPTS:
@@ -608,13 +695,13 @@ def validate_prompt_definitions(value: object) -> tuple[PromptDefinition, ...]:
     weight = _validate_weight(item.get("weight"), f"prompts[{index}].weight")
     definitions.append(PromptDefinition(prompt_id, text, weight))
 
-  if sum(definition.weight for definition in definitions) <= 0:
+  if not allow_zero and sum(definition.weight for definition in definitions) <= 0:
     raise ValueError("at least one prompt weight must be greater than zero")
   return tuple(definitions)
 
 
 def validate_weight_update(
-    value: object, definitions
+    value: object, definitions, *, allow_zero=False
 ) -> dict[int, float]:
   """Validate a complete weight update for the active prompt IDs."""
   if not isinstance(value, list):
@@ -634,13 +721,13 @@ def validate_weight_update(
     )
   if set(weights) != expected_ids:
     raise ValueError("weight update IDs must match the active prompt IDs")
-  if sum(weights.values()) <= 0:
+  if not allow_zero and sum(weights.values()) <= 0:
     raise ValueError("at least one prompt weight must be greater than zero")
   return weights
 
 
-def normalize_prompt_weights(values) -> np.ndarray:
-  """Normalize non-negative prompt weights to sum to one."""
+def normalize_prompt_weights(values, *, allow_zero=False) -> np.ndarray:
+  """Normalize weights, preserving zeros only for explicitly inactive groups."""
   weights = np.asarray(values, dtype=np.float32)
   if weights.ndim != 1 or weights.size == 0:
     raise ValueError("weights must be a non-empty one-dimensional array")
@@ -648,16 +735,18 @@ def normalize_prompt_weights(values) -> np.ndarray:
     raise ValueError("weights must be finite and non-negative")
   total = float(np.sum(weights))
   if total <= 0:
+    if allow_zero:
+      return np.zeros_like(weights)
     raise ValueError("at least one prompt weight must be greater than zero")
   return weights / total
 
 
-def blend_style_embeddings(embeddings, weights) -> np.ndarray:
+def blend_style_embeddings(embeddings, weights, *, allow_zero=False) -> np.ndarray:
   """Blend MusicCoCa embeddings before MRT2 performs RVQ quantization."""
   embedding_array = np.stack(
       [np.asarray(embedding, dtype=np.float32) for embedding in embeddings]
   )
-  normalized = normalize_prompt_weights(weights)
+  normalized = normalize_prompt_weights(weights, allow_zero=allow_zero)
   if embedding_array.ndim != 2:
     raise ValueError("each style embedding must be one-dimensional")
   if embedding_array.shape[0] != normalized.size:
@@ -665,10 +754,10 @@ def blend_style_embeddings(embeddings, weights) -> np.ndarray:
   return np.sum(embedding_array * normalized[:, np.newaxis], axis=0)
 
 
-def prompt_definitions_to_json(definitions) -> list[dict]:
+def prompt_definitions_to_json(definitions, *, allow_zero=False) -> list[dict]:
   """Return normalized client metadata for a prompt bank."""
   normalized = normalize_prompt_weights(
-      [definition.weight for definition in definitions]
+      [definition.weight for definition in definitions], allow_zero=allow_zero
   )
   return [
       {
@@ -719,9 +808,9 @@ def _validate_embeddings(definitions, embeddings) -> list[np.ndarray]:
   return arrays
 
 
-def _describe_mix(definitions) -> str:
+def _describe_mix(definitions, *, allow_zero=False) -> str:
   normalized = normalize_prompt_weights(
-      [definition.weight for definition in definitions]
+      [definition.weight for definition in definitions], allow_zero=allow_zero
   )
   return ", ".join(
       f"{definition.text}:{normalized[index]:.3f}"
@@ -750,6 +839,32 @@ def validate_audio_frame(waveform) -> np.ndarray:
         f"{samples.shape}; expected {(FRAME_SAMPLES, CHANNELS)}"
     )
   return samples
+
+
+def apply_solo_gate(
+    samples: np.ndarray,
+    *,
+    gate: float,
+    note_held: bool,
+    solo: bool,
+    decay_seconds: float = SOLO_GATE_DECAY_SECONDS,
+) -> tuple[np.ndarray, float]:
+  """Apply the Jam app's note gate and return audio plus the next gate."""
+  values = np.asarray(samples, dtype=np.float32)
+  if values.ndim != 2 or values.shape[1] != CHANNELS:
+    raise ValueError(f"gate samples must have shape [N, {CHANNELS}]")
+  if not solo:
+    return values, 1.0
+  if note_held:
+    return values, 1.0
+  if decay_seconds <= 0:
+    return np.zeros_like(values), 0.0
+  start = min(1.0, max(0.0, float(gate)))
+  decrement = np.arange(1, len(values) + 1, dtype=np.float32) / (
+      SAMPLE_RATE * decay_seconds
+  )
+  envelope = np.maximum(0.0, start - decrement)
+  return values * envelope[:, None], float(envelope[-1])
 
 
 def encode_pcm_f32le(samples: np.ndarray) -> bytes:

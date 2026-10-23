@@ -16,7 +16,7 @@ class LinuxWebStaticTest(unittest.TestCase):
 
   def test_javascript_element_bindings_exist_in_html(self):
     html = (WEB_ROOT / "index.html").read_text()
-    javascript = (WEB_ROOT / "app.js").read_text()
+    javascript = "\n".join(path.read_text() for path in WEB_ROOT.glob("*.js"))
     element_ids = re.findall(r"document\.querySelector\('#([^']+)'\)", javascript)
     self.assertGreater(len(element_ids), 40)
     for element_id in element_ids:
@@ -26,12 +26,13 @@ class LinuxWebStaticTest(unittest.TestCase):
   def test_static_asset_cache_versions_match(self):
     html = (WEB_ROOT / "index.html").read_text()
     javascript = (WEB_ROOT / "app.js").read_text()
-    self.assertIn("/static/style.css?v=10", html)
-    self.assertIn("/static/app.js?v=10", html)
-    self.assertIn("./hand-control.js?v=10", javascript)
-    self.assertIn("./modulation.js?v=10", javascript)
-    self.assertIn("/static/audio-worklet.js?v=10", javascript)
-    self.assertIn("message.protocol_version < 5", javascript)
+    self.assertIn("/static/style.css?v=12", html)
+    self.assertIn("/static/app.js?v=15", html)
+    self.assertIn("./hand-control.js?v=12", javascript)
+    self.assertIn("./visual-input.js?v=15", javascript)
+    self.assertIn("./modulation.js?v=11", javascript)
+    self.assertIn("/static/audio-worklet.js?v=11", javascript)
+    self.assertIn("message.protocol_version < 6", javascript)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MRT2 Linux Real-time</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/style.css?v=10" />
+    <link rel="stylesheet" href="/static/style.css?v=12" />
   </head>
   <body>
     <main class="shell">
@@ -21,7 +21,7 @@
         <div class="section-heading">
           <div>
             <p class="section-kicker">PROMPT MIXER</p>
-            <h2>最大6個のスタイルをブレンド</h2>
+            <h2>最大32個のスタイルをブレンド</h2>
           </div>
           <div class="mode-switch" aria-label="prompt control mode">
             <button id="list-mode" class="mode active">Sliders</button>
@@ -68,6 +68,77 @@
             <span id="record-status">録音停止中</span>
           </div>
         </div>
+      </section>
+
+      <section class="panel visual-panel">
+        <div class="section-heading compact-heading">
+          <div>
+            <p class="section-kicker">VISUAL MUSIC INPUT</p>
+            <h2>画像から音楽スタイルを追加</h2>
+          </div>
+        </div>
+        <div class="visual-controls">
+          <label>入力モード
+            <select id="visual-mode">
+              <option value="still">静止画像（1回だけ推論）</option>
+              <option value="screen">画面共有</option>
+              <option value="camera">カメラ</option>
+            </select>
+          </label>
+          <label>VLMモデル
+            <select id="visual-model">
+              <option value="gemma" selected>Gemma 4 E4B · Ollama</option>
+              <option value="qwen">Qwen3.5-4B · Ollama</option>
+              <option value="gemini">Gemini API · Flash-Lite</option>
+            </select>
+          </label>
+          <label>通常テキスト : VLM
+            <select id="visual-ratio">
+              <option value="4:1">4 : 1</option>
+              <option value="3:1">3 : 1</option>
+              <option value="2:1" selected>2 : 1</option>
+              <option value="3:2">3 : 2</option>
+              <option value="4:3">4 : 3</option>
+              <option value="1:1">1 : 1</option>
+              <option value="3:4">3 : 4</option>
+              <option value="2:3">2 : 3</option>
+              <option value="1:2">1 : 2</option>
+              <option value="1:3">1 : 3</option>
+              <option value="1:4">1 : 4</option>
+              <option value="0:1">0 : 1（VLMのみ）</option>
+            </select>
+          </label>
+          <label>更新方式
+            <select id="visual-timing" disabled>
+              <option value="interval" selected>秒間隔で更新</option>
+              <option value="auto">自動（推論完了後に次を開始）</option>
+            </select>
+          </label>
+          <label>更新間隔（秒）
+            <input id="visual-interval" type="number" min="0.5" max="60" step="0.5" value="3" disabled />
+          </label>
+        </div>
+        <label class="switch-card">
+          <input id="visual-allow-extra-tags" type="checkbox" />
+          <span>
+            <b>5個を超えるタグも使用する</b>
+            <small>オフでは5個を超えた出力全体を不採用にします。VLMへの指示は3〜5個のままです。</small>
+          </span>
+        </label>
+        <input id="visual-file" type="file" accept="image/jpeg,image/png,image/webp,image/bmp" aria-label="静止画像" />
+        <div class="visual-preview">
+          <img id="visual-preview" alt="選択画像" hidden />
+          <video id="visual-video" muted playsinline hidden></video>
+        </div>
+        <div class="prompt-actions">
+          <button id="visual-run" class="secondary">画像入力を開始 / 再実行</button>
+          <button id="visual-disable" class="secondary">画像入力を無効化</button>
+        </div>
+        <p class="hint">上のスライダー・2D Surfaceは通常群内の比率です。VLM群は各タグに均等配分します。</p>
+        <p class="hint">選択した画像・スナップショットを推論先へ送信します。Gemini選択時はGoogleのAPIへ送信します。</p>
+        <p id="visual-share" class="hint">通常群 100% / VLM群 0%</p>
+        <p id="visual-tags" class="visual-tags" aria-label="VLMの音楽タグ">まだタグはありません</p>
+        <p id="visual-status" class="hint" role="status">画像入力は無効です。</p>
       </section>
 
       <section class="panel global-panel">
@@ -210,10 +281,13 @@
             <input id="auto-strum" type="checkbox" checked />
             <span>Auto-Strum</span>
           </label>
-          <label class="check-control">
-            <input id="midi-solo" type="checkbox" />
-            <span>Solo</span>
-          </label>
+          <div class="performance-mode">
+            <span>Performance</span>
+            <div class="mode-switch" aria-label="Jam or Solo performance mode">
+              <button id="jam-mode" class="mode active">Jam</button>
+              <button id="solo-mode" class="mode">Solo</button>
+            </div>
+          </div>
           <div class="octave-control">
             <button id="octave-down" class="mini-button">−</button>
             <span id="octave-label">Keyboard C3</span>
@@ -227,6 +301,9 @@
         </div>
         <p class="hint">
           PCキーボード: A/W/S/E/D/F/T/G/Y/H/U/J/K/O/L/P/;、Z/Xでオクターブ変更。
+        </p>
+        <p id="performance-mode-hint" class="hint">
+          Jamは入力ノートに伴奏を加えられます。Soloは入力外の音を抑えます。
         </p>
       </section>
 
@@ -365,6 +442,6 @@
         </dl>
       </section>
     </main>
-    <script type="module" src="/static/app.js?v=10"></script>
+    <script type="module" src="/static/app.js?v=15"></script>
   </body>
 </html>

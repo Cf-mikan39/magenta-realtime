@@ -57,6 +57,8 @@ Issues = "https://github.com/magenta/magenta-realtime/issues"
 jax = ["jax", "flax", "optax", "jaxtyping", "typing_extensions"]
 mlx = ["mlx", "flax", "typing_extensions"]
 realtime = ["fastapi>=0.115", "uvicorn[standard]>=0.34"]
+visual = ["httpx>=0.28", "pillow>=10"]
+gemini = ["google-genai>=1.0", "pillow>=10"]
 dev = ["jupyter", "ipython", "pytest", "matplotlib", "pytest-cov"]
 
 # Listener-eval bulk generation

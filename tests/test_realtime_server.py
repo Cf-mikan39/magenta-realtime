@@ -28,6 +28,7 @@ from magenta_rt.realtime_server import encode_pcm_f32le
 from magenta_rt.realtime_server import FRAME_SAMPLES
 from magenta_rt.realtime_server import JaxRealtimeProducer
 from magenta_rt.realtime_server import MidiConditioning
+from magenta_rt.realtime_server import PerformanceConditioning
 from magenta_rt.realtime_server import PromptConditioning
 from magenta_rt.realtime_server import PromptDefinition
 from magenta_rt.realtime_server import PromptMixer
@@ -37,6 +38,7 @@ from magenta_rt.realtime_server import normalize_prompt_weights
 from magenta_rt.realtime_server import validate_prompt_definitions
 from magenta_rt.realtime_server import validate_prompt
 from magenta_rt.realtime_server import WavRecorder
+from magenta_rt.realtime_server import apply_solo_gate
 
 
 class _FakeWaveform:
@@ -56,16 +58,18 @@ class _FakeMrt:
     self.drums = []
     self.temperatures = []
     self.top_ks = []
+    self.cfg_notes = []
 
   def generate(
       self, *, style, frames, state, notes=None, drums=None,
-      temperature=None, top_k=None
+      temperature=None, top_k=None, cfg_notes=None
   ):
     self.states.append(state)
     self.notes.append(notes)
     self.drums.append(drums)
     self.temperatures.append(temperature)
     self.top_ks.append(top_k)
+    self.cfg_notes.append(cfg_notes)
     next_state = 1 if state is None else state + 1
     return _FakeWaveform(float(style)), next_state
 
@@ -118,6 +122,17 @@ class PromptMixerTest(unittest.TestCase):
               {"id": 1, "text": "one", "weight": 0.0},
               {"id": 1, "text": "two", "weight": 0.0},
           ]
+      )
+
+  def test_accepts_up_to_32_prompts(self):
+    prompts = [
+        {"id": index, "text": f"prompt {index}", "weight": 1.0}
+        for index in range(32)
+    ]
+    self.assertEqual(len(validate_prompt_definitions(prompts)), 32)
+    with self.assertRaises(ValueError):
+      validate_prompt_definitions(
+          prompts + [{"id": 32, "text": "too many", "weight": 1.0}]
       )
 
   def test_weight_updates_do_not_replace_cached_embeddings(self):
@@ -281,6 +296,57 @@ class SamplingConditioningTest(unittest.TestCase):
     self.assertEqual(mrt.temperatures[0], 0.75)
     self.assertIn(1.5, mrt.temperatures)
     self.assertIn(96, mrt.top_ks)
+
+
+class PerformanceConditioningTest(unittest.TestCase):
+
+  def test_switches_jam_and_solo(self):
+    performance = PerformanceConditioning(base_cfg_notes=2.4)
+    self.assertEqual(performance.snapshot().mode, "jam")
+    snapshot = performance.configure(mode="solo")
+    self.assertEqual(snapshot.mode, "solo")
+    self.assertEqual(snapshot.revision, 1)
+    with self.assertRaises(ValueError):
+      performance.configure(mode="invalid")
+
+  def test_solo_gate_opens_and_releases(self):
+    samples = np.ones((FRAME_SAMPLES, 2), dtype=np.float32)
+    open_audio, gate = apply_solo_gate(
+        samples, gate=0.25, note_held=True, solo=True
+    )
+    np.testing.assert_array_equal(open_audio, samples)
+    self.assertEqual(gate, 1.0)
+    released, next_gate = apply_solo_gate(
+        samples, gate=1.0, note_held=False, solo=True
+    )
+    self.assertLess(next_gate, 1.0)
+    self.assertGreater(next_gate, 0.0)
+    self.assertGreater(released[0, 0], released[-1, 0])
+    jam_audio, jam_gate = apply_solo_gate(
+        samples, gate=0.0, note_held=False, solo=False
+    )
+    np.testing.assert_array_equal(jam_audio, samples)
+    self.assertEqual(jam_gate, 1.0)
+
+  def test_producer_passes_solo_cfg_without_resetting_state(self):
+    mrt = _FakeMrt()
+    midi = MidiConditioning(enabled=True, unmask_width=127)
+    midi.note_on(60)
+    performance = PerformanceConditioning(mode="solo", base_cfg_notes=2.4)
+    ring = StereoRingBuffer(2 * FRAME_SAMPLES)
+    producer = JaxRealtimeProducer(
+        mrt=mrt,
+        prompt=PromptConditioning("one", 0.5),
+        ring_buffer=ring,
+        midi=midi,
+        performance=performance,
+    )
+    producer.start()
+    self.assertTrue(ring.wait_for_available(FRAME_SAMPLES, timeout=1.0))
+    producer.stop()
+    producer.join(timeout=1.0)
+    self.assertEqual(mrt.cfg_notes[0], 2.4)
+    self.assertEqual(mrt.states[0], None)
 
 
 class WavRecorderTest(unittest.TestCase):

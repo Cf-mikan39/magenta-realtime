@@ -32,11 +32,17 @@ ssh -N -L 8000:127.0.0.1:8000 USER@GPU_SERVER
 ```
 
 Then open <http://127.0.0.1:8000> in Chrome or Edge. Press **Start** and allow
-the browser to start Web Audio. Up to six prompt texts are embedded once and
+the browser to start Web Audio. Up to 32 prompt texts are embedded once and
 cached. Slider changes blend the cached embeddings immediately; text edits are
 encoded only after pressing **Encode text changes**. The 2D surface uses
 normalized inverse-square-distance weights. None of these controls resets the
 recurrent streaming state.
+
+The native MLX engine stores six prompt slots, but the Linux/JAX path blends
+MusicCoCa embeddings before tokenization and therefore does not change the
+model input shape when more prompts are added. The browser and WebSocket retain
+a 32-prompt safety limit to bound text-encoding work and request size. New 2D
+nodes use a golden-angle layout to reduce overlap beyond the first six.
 
 The browser buffer starts at three frames. If an AudioWorklet underrun occurs,
 it automatically increases its target by one frame, up to six frames. This
@@ -68,13 +74,26 @@ is observed for one frame.
 - **Auto-Strum on** sends token 3 while a note is held, allowing the model to
   retrigger, bow, strum, or arpeggiate it.
 - **Auto-Strum off** sends an onset token followed by continuation tokens.
-- **Solo off** unmasks four neighboring pitches and lets MRT2 add
-  accompaniment.
-- **Solo on** explicitly marks every non-held pitch off.
 - Sustain pedal CC64 and All Notes Off CC120/CC123 are supported in the browser.
 
 The PC keyboard mapping follows the official app: A/W/S/E/D/F/T/G/Y/H/U/J
 starts at C3, K/O/L/P/; continues above it, and Z/X changes octave.
+
+### Jam / Solo performance mode
+
+This switch follows the dedicated native Jam app rather than the simpler Solo
+toggle in the main plugin:
+
+- **Jam** uses the visible prompt text unchanged and an unmask width of zero.
+  Held notes are explicit while the rest remain masked, allowing accompaniment.
+- **Solo** re-encodes every active text as `SOLO <prompt>`, uses an unmask width
+  of 127 so every non-held note is explicitly off, and gates the outgoing audio
+  after note release with the native two-second linear decay. During the same
+  release the Note CFG value ramps from its configured value toward 50.
+- Solo playback stops after 30 seconds without MIDI note activity, matching the
+  Jam app. Switching modes preserves recurrent streaming state; the first
+  switch in each direction may run MusicCoCa encoding, after which cached
+  embeddings are reused.
 
 ## Drum conditioning
 
@@ -152,3 +171,105 @@ generation thread.
 Only one WebSocket stream may own the model at a time. This is deliberate: two
 concurrent generation loops would compete for the same GPU and invalidate the
 real-time latency measurements.
+
+## Visual music input
+
+The **画像から音楽スタイルを追加** panel adds a separate VLM tag group.
+The default model is **Gemma 4 E4B** (`gemma4:e4b`) served by the existing
+Ollama instance at `http://127.0.0.1:21434`. Qwen3.5-4B (`qwen3.5:4b`) and
+Gemini (`gemini-3.5-flash-lite`) are selectable in every input mode.
+
+Install the optional dependencies in the existing MRT2 environment:
+
+```sh
+uv pip install -e ".[realtime,visual,gemini]"
+python scripts/jax_realtime_web.py --model mrt2_small --port 8001
+```
+
+Start Ollama separately using your existing `ollama-local/env.sh` environment
+and `ollama_local serve`. This application does not start Ollama or download
+models. `--ollama-host http://127.0.0.1:21434` can override its address. Gemini
+requires `GEMINI_API_KEY` in the **server's** environment; no key is sent to the
+browser. Selecting Gemini sends the image to Google's API; Ollama sends it
+only to the configured Ollama host.
+
+1. Choose **静止画像**, **画面共有**, or **カメラ** and the VLM model.
+2. For a still image, select a JPEG, PNG, WebP, or BMP file (up to 8 MiB and
+   24 megapixels). For live sources, choose fixed snapshot intervals (default
+   3 s) or **自動** (start the next snapshot after inference and tag application
+   finish). Auto submits only one image at a time; errors retry after 1 s.
+3. Press **画像入力を開始 / 再実行**. Screen sharing and camera access request
+   browser permission. Inputs prepared before playback are inferred when
+   playback starts. Screen sharing requires a button click and a secure
+   browser context, such as localhost through the SSH tunnel.
+4. Press the existing **再生開始** button if playback is stopped.
+
+The three sources are exclusive. Selecting another mode/model disables the
+previous source; press the visual start button to activate the new selection.
+The camera can be shared with the existing hand/gesture controller. Stopping
+either consumer does not stop the other's camera stream.
+
+Still images run once per explicit visual start. Their tags survive audio
+Stop/Start within the same page, without another VLM request. Live capture
+stops on audio Stop/disconnect or when the screen/camera track ends; start
+the visual input again to resume. **画像入力を無効化** clears the visual tags.
+
+The ordinary 32-prompt limit, sliders, 2D Surface, LFO, MIDI CC and hand
+targets apply only to the normal group. Their percentages are **within that
+group**. With normal:VLM set to 2:1, the normal group's mixed embedding receives
+2/3 of the total coefficient. Each of m visual tags receives 1/(3m).
+Ratios use integers 1–4 on either side, with equivalent ratios shown once:
+4:1, 3:1, 2:1 (default), 3:2, 4:3, 1:1, 3:4, 2:3, 1:2, 1:3, and 1:4.
+**0:1 (VLM only)** excludes normal text from the generated style. Normal text
+controls remain available, but do not affect the style until a nonzero normal
+ratio is selected again. While no VLM result is available, including when
+visual input is disabled, 0:1 uses masked style conditioning instead of falling
+back to normal text. Previously buffered audio still plays normally.
+At 0:1 all normal sliders may be 0%, both at playback start and during playback.
+Their raw and displayed normalized weights remain zero. To return to a ratio
+that uses normal text, first raise at least one normal slider above 0%; an
+attempted ratio change with all normal weights at zero keeps 0:1 and displays
+an explanation. Normal-text ratios still reject an all-zero normal group.
+For example, 1:4 allocates 20% to normal text and 80% to the VLM group.
+Tags are individually
+embedded with the same mapper/seed as normal prompts, then averaged before
+the groups are mixed. The final embedding goes through the existing RVQ and
+JAX generation path. Equal coefficients do not guarantee equal audible effects.
+Solo uses the same `SOLO ` prefix for each visual tag without re-running VLM.
+
+No visual result means normal conditioning at 100%, except for 0:1 as above.
+Failures keep the last
+successful result from the same mode/model; selecting a new source/model
+clears that result until a new one succeeds. The prompt asks for 3–5 tags,
+never more than 5. **5個を超えるタグも使用する** is off by default: an output
+containing more than 5 nonempty comma fields is rejected in full. Turn it on
+to accept all returned tags, including the sixth and later tags, with equal
+weight within the VLM group. The instruction still requests 3–5 tags. Both
+settings keep the existing 1024-character output and 128-character per-tag
+limits, remove empty comma fields and duplicates, and reject multiline output.
+The setting is checked again before publishing a style, so changing it during
+inference or embedding cannot apply a result that the new setting rejects.
+Turning it off also removes an already applied oversized result; in 0:1 this
+returns to masked style conditioning. For a still image, press visual start
+again to obtain a new result. Cached static tags respect the setting on restart.
+
+Visual work is asynchronous. At most one image is processed plus one latest
+pending image per stream. Outdated generations cannot apply their results.
+The server serializes MusicCoCa text/mapper calls through a shared worker
+with a 256-entry cache. Normal text encoding no longer stalls MIDI/control
+reception. Images are sent as bounded HTTP bodies, and progress/results use
+additional JSON messages on the existing WebSocket. The PCM transport,
+recurrent JAX state, and audio buffers are unchanged.
+
+Local VLM and MRT2 may still compete for GPU resources. Check the existing
+generation time, deadline-miss and underrun metrics during simultaneous use;
+standalone VLM benchmark times are not end-to-end music response times.
+Remote inference has a 60-second deadline. A cancelled HTTP call does not
+guarantee the Ollama server has already stopped GPU work.
+
+Dependency-light checks (no model weights/API calls):
+
+```sh
+python -m unittest discover -s tests -p 'test_visual*.py' -v
+node --experimental-default-type=module tests/visual_input_test.mjs
+```
