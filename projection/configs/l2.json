@@ -1,0 +1,22 @@
+{
+  "models": {
+    "clip": "../../../models/CLIP/clip-vit-base-patch32",
+    "imagebind": "../../../models/ImageBind/imagebind_huge.pth"
+  },
+  "wandb": {
+    "enabled": false,
+    "project": "mrt2-image-audio-projection",
+    "entity": null,
+    "name": null,
+    "group": null,
+    "tags": [],
+    "mode": "online",
+    "log_model": false,
+    "resume": "auto"
+  },
+  "target_normalization": "l2",
+  "training_output_normalization": "l2",
+  "loss": {"mse_weight": 0.0, "cosine_weight": 1.0, "norm_weight": 0.0},
+  "projection": {"hidden_dim": 1024, "activation": "gelu", "dropout": 0.1},
+  "training": {"epochs": 50, "batch_size": 64, "learning_rate": 0.0001, "seed": 42}
+}

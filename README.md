@@ -1,134 +1,61 @@
-# Magenta RealTime 2
 
-[![CLI Tests](https://github.com/magenta/magenta-realtime/actions/workflows/cli_tests.yml/badge.svg)](https://github.com/magenta/magenta-realtime/actions/workflows/cli_tests.yml)
+![Web UI overview](docs/images/webui.png)
 
-> [!NOTE]
-> **Go [here](https://magenta.withgoogle.com/mrt2) for pre-built Apps & Plugins.**
+# Magenta RealTime 2 — Linux Web UI & Visual Music Control
 
-Magenta RealTime 2 (MRT2) is a state-of-the-art open-weights model for real-time music generation. It contains several key components
-* An [open-weights model](https://huggingface.co/google/magenta-realtime-2)
-* A [Python library](README.md) `magenta-rt` for inference with JAX and MLX backends
-* A [C++ inference engine](core/README.md) `magentart::core` for efficient streaming audio generation on Apple Silicon MacBooks
-* A suite of [example applications](examples/README.md) built on the inference engine.
+> A research fork of [Google Magenta RealTime 2](https://github.com/magenta/magenta-realtime), extending the original model with **real-time music generation on Linux/NVIDIA GPUs**, a **browser-based control interface**, and **visual-to-music control using VLMs**.
 
-Use this project to run inference, build a DAW plugin, or embed the model into new applications of your imagination.
-Future updates will support supervised fine-tuning.
+This repository builds on the original MRT2 model and Python/JAX inference library. For the underlying model, official applications, model downloads, and general installation instructions, see the [upstream repository](https://github.com/magenta/magenta-realtime) and [official documentation](https://magenta.github.io/magenta-realtime/).
 
-📖 **Full documentation:** https://magenta.github.io/magenta-realtime/
-(or build it locally — see [`docs/README.md`](docs/README.md)).
+## Features Added in This Fork
 
-> [!NOTE]
-> **Looking for Magenta RealTime v1?** The original model and code have been moved to the [`v1_legacy`](https://github.com/magenta/magenta-realtime/tree/v1_legacy) branch.
+- **Linux real-time streaming:** Stateful MRT2 generation and browser playback using JAX, FastAPI, and WebSockets (tested with `mrt2_small` on NVIDIA GPU hardware).
+- **Interactive Web UI:** A 2D prompt surface, sliders for prompt weights and generation parameters, and live control without restarting the music stream.
+- **Visual input:** Image and camera input for exploring visual-to-music interaction.
+- **Three VLM backends:** Visual scenes are converted into music-related style descriptions (e.g., genre, mood, and instruments), then used as conditioning for MRT2:
+  - **Gemini 3.5 Flash-Lite** via the Gemini API
+  - **Gemma 4 E4B** via local Ollama (`gemma4:e4b`)
+  - **Qwen 3.5 4B** via local Ollama (`qwen3.5:4b`)
 
-## Repo Highlights
+## Web UI
 
-- `magenta_rt/` — Python inference library (JAX / MLX backends).
-- `core/` — C++ inference library (`magentart::core`).
-- `examples/mrt2/auv3` — All-in-one AUv3 plugin for DAWs.
-- `examples/mrt2/standalone` — All-in-one standalone macOS app.
-- `examples/jam/` — App for exploring note control.
-- `examples/collider/` — App for exploring prompt space.
-- `notebooks/` - Notebook for trying Python API.
+Interactively change musical conditions through the 2D surface and sliders while listening to the generated audio. The camera can also provide visual input for VLM-based control.
 
-## Hardware requirements
+![2D surface and sliders](docs/images/2dsurface.png)
+![Landmark interaction](docs/images/landmark.png)
 
-**Real-time streaming** requires **Apple Silicon** (M-series). We offer two model sizes:
+## Visual-to-Music Control
 
-- **`mrt2_small`** (230M parameters) — runs real-time on any Apple Silicon Mac, including Air models.
-- **`mrt2_base`** (2.4B parameters) — higher quality; requires a Pro Max chip for real-time streaming.
+The Web UI supports Gemini 3.5 Flash-Lite (API) and two local VLMs (Gemma 4 E4B and Qwen 3.5 4B through Ollama). An image or camera frame is interpreted as a music-style description and used to update the generation condition.
 
-The table below shows which devices support **real-time streaming** (generating audio faster than playback):
+![VLM image-to-music interface](docs/images/vlm.png)
 
-| Device | `mrt2_small` (230M) | `mrt2_base` (2.4B) |
-|---|---|---|
-| M5 Max | ✅ | ✅ |
-| M3 Max | ✅ | ✅ |
-| M2 Max | ✅ | ✅ |
-| M4 Pro | ✅ | ✅ |
-| M2 Pro | ✅ | ❌ |
-| M1 Pro | ✅ | ❌ |
-| M4 Air | ✅ | ❌ |
-| M3 Air | ✅ | ❌ |
-| M1 Air | ✅ | ❌ |
+## Running the Linux Web UI
 
-> **Note:** Both models can also run **offline (non-real-time) inference** on any Apple Silicon Mac or NVIDIA GPU via the Python library. See more details on [`docs/models.md`](docs/models.md).
+First, install the project's Python dependencies and download the MRT2 model/resources. Refer to the upstream [installation guide](https://github.com/magenta/magenta-realtime/blob/main/docs/installation.md) for general JAX/CUDA setup. Run the following commands from the repository root in the environment configured for this fork.
 
-## Quickstart on Apple Silicon
+### Optional: Set up a VLM
+
+- **Gemini 3.5 Flash-Lite:** Set the `GEMINI_API_KEY` environment variable in the shell before launching the Web UI server.
+- **Gemma 4 E4B / Qwen 3.5 4B:** Install [Ollama](https://ollama.com/), download the required model (`gemma4:e4b` and/or `qwen3.5:4b`), and ensure that the Ollama server is running in a separate terminal or as a service.
+
+### Launch the server
 
 ```bash
-# Install uv if you haven't and create a venv
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv --python 3.12
-source .venv/bin/activate
-
-# Install dependencies (Python dev)
-uv pip install "magenta-rt[mlx]"
-
-# Download resources: style model and codec model
-# (i.e., MusicCoCa and SpectroStream)
-mrt models init
-# Download the streaming model you want to use
-mrt models download
-# Generate 4 seconds of music (change to `mrt2_small` for small model)
-mrt mlx generate --prompt "disco funk" --duration 4.0 --model=mrt2_base
+python scripts/jax_realtime_web.py \
+  --model mrt2_small \
+  --port 8001 \
+  --ollama-host http://127.0.0.1:11434
 ```
 
-### Python Development
+Open **http://127.0.0.1:8001** in your browser.
 
-For local development, clone the repo instead of installing from PyPI:
+The browser UI can be used without a VLM; Gemini credentials or Ollama are needed only when selecting their respective visual-control backends. 
 
-```bash
-git clone --recurse-submodules https://github.com/magenta/magenta-realtime.git
-cd magenta-realtime
-uv pip install -e ".[mlx]"
-```
+## Upstream, License, and Citation
 
-### C++ App Development
+This is an independent research fork, **not an official Google Magenta release**. The original MRT2 model and upstream code were developed by Google Magenta / Google DeepMind. See the [official repository](https://github.com/magenta/magenta-realtime) for the original features and documentation.
 
-To get started building C++ apps, perform the following setup:
+The upstream source code is distributed under **Apache License 2.0**, and MRT2 model weights are distributed under **Creative Commons Attribution 4.0** (see the upstream [model card](https://github.com/magenta/magenta-realtime/blob/main/MODEL.md)). Preserve upstream copyright and license notices when redistributing modified files. See the repository's license files for the applicable terms.
 
-```bash
-# Install dependencies
-uv pip install "cmake<3.28"
-
-# Build hello_mrt2 (a basic command-line interface)
-cmake . -B build
-cmake --build build --target hello_mrt2 -j10
-
-# Generate 4 seconds of music
-./build/examples/hello_mrt2/hello_mrt2 \
-    ~/Documents/Magenta/magenta-rt-v2/models/mrt2_base/mrt2_base.mlxfn \
-    ~/Documents/Magenta/magenta-rt-v2/resources \
-    100 \
-    --prompt "ambient pads with sub bass"
-```
-
-See the full documentation:
-
-- [Installation](docs/installation.md)
-- [Models & checkpoints](docs/models.md)
-- [Inference](docs/inference.md)
-- [Exporting models](docs/exporting.md)
-- [Latency benchmark](docs/benchmark.md)
-- [Testing](docs/testing.md)
-
-## Other resources
-
-- [Get Started](https://magenta.withgoogle.com/mrt2)
-- [Blog Post](https://magenta.withgoogle.com/magenta-realtime-2)
-- [Hugging Face](https://huggingface.co/google/magenta-realtime-2)
-
-## Citing this work
-
-Please cite our previous [technical report](https://arxiv.org/abs/2508.04651):
-
-**BibTeX:**
-
-```
-@article{gdmlyria2025live,
-    title={Live Music Models},
-    author={Caillon, Antoine and McWilliams, Brian and Tarakajian, Cassie and Simon, Ian and Manco, Ilaria and Engel, Jesse and Constant, Noah and Li, Pen and Denk, Timo I. and Lalama, Alberto and Agostinelli, Andrea and Huang, Anna and Manilow, Ethan and Brower, George and Erdogan, Hakan and Lei, Heidi and Rolnick, Itai and Grishchenko, Ivan and Orsini, Manu and Kastelic, Matej and Zuluaga, Mauricio and Verzetti, Mauro and Dooley, Michael and Skopek, Ondrej and Ferrer, Rafael and Borsos, Zal{\'a}n and van den Oord, {\"A}aron and Eck, Douglas and Collins, Eli and Baldridge, Jason and Hume, Tom and Donahue, Chris and Han, Kehang and Roberts, Adam},
-    journal={arXiv:2508.04651},
-    year={2025}
-}
-```
+For the original model and research, see the upstream citation instructions and the [Live Music Models technical report](https://arxiv.org/abs/2508.04651).

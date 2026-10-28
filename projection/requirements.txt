@@ -1,0 +1,8 @@
+# Install ONLY in a separate Projection environment, never the MRT2 .venv.
+# Choose a compatible CPU/CUDA torch build first; see docs/image_audio_projection.md.
+numpy>=1.26,<2
+Pillow>=10,<12
+torch>=2.1,<3
+transformers>=4.40,<5
+# Official ImageBind is installed separately from a recorded Git revision.
+# Keep its torchvision/torchaudio/timm dependencies in this environment as well.
